@@ -37,7 +37,7 @@ def _get_client(config: dict) -> OpenAI:
         if len(_client_cache) >= _MAX_CACHE_SIZE:
             oldest_key = next(iter(_client_cache))
             del _client_cache[oldest_key]
-            logger.debug(f"Cleared oldest LLM client cache entry")
+            logger.debug("Cleared oldest LLM client cache entry")
 
         _client_cache[cache_key] = OpenAI(
             api_key=get_config_value(config, "llm.api_key"),

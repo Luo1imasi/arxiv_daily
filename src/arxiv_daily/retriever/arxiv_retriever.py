@@ -1,9 +1,11 @@
 import asyncio
-import re
-import math
 import hashlib
+import math
+import re
 from collections import Counter
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+from typing import Any, cast, override
 
 import feedparser
 import arxiv
@@ -14,11 +16,13 @@ from tqdm import tqdm
 from .base import BaseRetriever, register_retriever
 from ..protocol import Paper, CorpusPaper
 from ..config import get_config_value
-from ..utils import parallel_execute
+from ..utils import make_content_key, parallel_execute
 from ..llm import extract_keywords_from_paper
 from .. import database as db
 
 RawPaper = dict[str, object]
+_ARXIV = cast(Any, arxiv)
+_FEEDPARSER = cast(Any, feedparser)
 
 TOKEN_PATTERN = re.compile(r"[a-z][a-z0-9+\-\.]{1,}")
 STOPWORDS = {
@@ -81,12 +85,36 @@ def _paper_published(paper: RawPaper):
         return None
 
 
+def _raw_paper_text(value: object | None) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _raw_paper_authors(paper: RawPaper) -> list[str]:
+    authors = paper.get("authors", [])
+    if not isinstance(authors, list):
+        return []
+    return [str(author) for author in authors]
+
+
+def _raw_paper_float(value: object | None, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return default
+    return default
+
+
 def _paper_retrieval_score(paper: RawPaper) -> float:
-    return float(paper.get("retrieval_score", 0.0) or 0.0)
+    return _raw_paper_float(paper.get("retrieval_score"), 0.0)
 
 
 def _paper_lookback_score(paper: RawPaper) -> float:
-    return float(paper.get("lookback_score", 0.0) or 0.0)
+    return _raw_paper_float(paper.get("lookback_score"), 0.0)
 
 
 def _to_raw_paper(paper: ArxivResult | RawPaper) -> RawPaper:
@@ -158,8 +186,8 @@ def _extract_local_keywords_from_corpus(corpus: list[CorpusPaper], limit: int) -
     if not corpus:
         return []
 
-    phrase_doc_freq = Counter()
-    phrase_scores = Counter()
+    phrase_doc_freq: dict[str, int] = {}
+    phrase_scores: dict[str, float] = {}
     for paper in corpus:
         title_tokens = _tokenize(paper.title)
         abstract_tokens = _tokenize(paper.abstract or "")
@@ -175,14 +203,18 @@ def _extract_local_keywords_from_corpus(corpus: list[CorpusPaper], limit: int) -
         }
 
         for term in doc_terms:
-            phrase_doc_freq[term] += 1
-            phrase_scores[term] += 1.0 + (1.5 if term in title_tokens else 0.0)
+            phrase_doc_freq[term] = phrase_doc_freq.get(term, 0) + 1
+            phrase_scores[term] = phrase_scores.get(term, 0.0) + (
+                1.0 + (1.5 if term in title_tokens else 0.0)
+            )
         for phrase in doc_phrases:
-            phrase_doc_freq[phrase] += 1
-            phrase_scores[phrase] += 2.0 + (1.5 if phrase in " ".join(title_tokens) else 0.0)
+            phrase_doc_freq[phrase] = phrase_doc_freq.get(phrase, 0) + 1
+            phrase_scores[phrase] = phrase_scores.get(phrase, 0.0) + (
+                2.0 + (1.5 if phrase in " ".join(title_tokens) else 0.0)
+            )
 
     total_docs = max(len(corpus), 1)
-    scored = []
+    scored: list[tuple[float, int, str]] = []
     for phrase, doc_freq in phrase_doc_freq.items():
         if total_docs >= 10 and doc_freq / total_docs > 0.6:
             continue
@@ -197,8 +229,8 @@ def _compute_bm25_scores(papers: list[RawPaper], query_terms: list[str]) -> dict
     if not papers or not query_terms:
         return {}
 
-    tokenized_docs = []
-    doc_freq = Counter()
+    tokenized_docs: list[tuple[str, list[str]]] = []
+    doc_freq: Counter[str] = Counter()
     for paper in papers:
         tokens = _tokenize(f"{_paper_title(paper)} {_paper_summary(paper)}")
         tokenized_docs.append((_paper_entry_id(paper), tokens))
@@ -206,7 +238,7 @@ def _compute_bm25_scores(papers: list[RawPaper], query_terms: list[str]) -> dict
             doc_freq[token] += 1
 
     avgdl = sum(len(tokens) for _, tokens in tokenized_docs) / max(len(tokenized_docs), 1)
-    query_token_counts = Counter()
+    query_token_counts: Counter[str] = Counter()
     for term in query_terms:
         query_token_counts.update(_tokenize(term))
     if not query_token_counts:
@@ -248,11 +280,15 @@ def _normalize_scores(scores: dict[str, float]) -> dict[str, float]:
     return {key: (value - min_score) / (max_score - min_score) for key, value in scores.items()}
 
 
-def _dedupe_arxiv_results(papers: list[RawPaper]) -> list[RawPaper]:
+def _dedupe_arxiv_results(papers: object) -> list[ArxivResult | RawPaper]:
+    if not isinstance(papers, list):
+        return []
     seen_ids = set()
-    deduped = []
+    deduped: list[ArxivResult | RawPaper] = []
     for paper in papers:
-        paper_id = _paper_entry_id(paper)
+        if not isinstance(paper, (dict, ArxivResult)):
+            continue
+        paper_id = _paper_entry_id(_to_raw_paper(paper))
         if not paper_id or paper_id in seen_ids:
             continue
         seen_ids.add(paper_id)
@@ -264,10 +300,14 @@ def _dedupe_arxiv_results(papers: list[RawPaper]) -> list[RawPaper]:
 class ArxivRetriever(BaseRetriever):
     name = "arxiv"
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict[str, Any]):
         super().__init__(config)
-        self.source_config = get_config_value(config, "source.arxiv")
-        self.executor_config = get_config_value(config, "executor")
+        self.source_config: dict[str, Any] = cast(
+            dict[str, Any], get_config_value(config, "source.arxiv")
+        )
+        self.executor_config: dict[str, Any] = cast(
+            dict[str, Any], get_config_value(config, "executor", {})
+        )
         if not self.source_config.get("category"):
             raise ValueError("arxiv category must be specified in config")
         self.use_keyword_search = bool(get_config_value(config, "source.arxiv.use_keyword_search"))
@@ -313,10 +353,15 @@ class ArxivRetriever(BaseRetriever):
         }
         return hashlib.sha1(repr(payload).encode("utf-8")).hexdigest()
 
+    @override
     def _retrieve_raw_papers(self) -> list[RawPaper]:
         categories = self.source_config["category"]
         if isinstance(categories, str):
             categories = [categories]
+        elif isinstance(categories, list):
+            categories = [str(category) for category in categories]
+        else:
+            raise ValueError("arxiv category must be a string or list of strings")
 
         if self.use_keyword_search:
             logger.info("Using keyword-based search mode")
@@ -405,10 +450,10 @@ class ArxivRetriever(BaseRetriever):
         )
 
         llm_enabled = bool(self.config.get("llm", {}).get("api_key"))
-        papers_to_extract = []
+        papers_to_extract: list[CorpusPaper] = []
         if llm_enabled:
             for paper in corpus_for_keywords:
-                cache_key = f"{paper.title}|{paper.abstract[:50] if paper.abstract else ''}"
+                cache_key = make_content_key(paper.title, paper.abstract or "")
                 if cache_key not in cached_keywords:
                     papers_to_extract.append(paper)
 
@@ -416,20 +461,20 @@ class ArxivRetriever(BaseRetriever):
             logger.info(
                 f"Extracting keywords for {len(papers_to_extract)} new papers..."
             )
-            import concurrent.futures
-
-            def extract_single(paper):
+            def extract_single(paper: CorpusPaper) -> tuple[CorpusPaper, list[str]]:
                 keywords = extract_keywords_from_paper(
                     paper.title, paper.abstract or "", self.config, max_keywords=5
                 )
                 return paper, keywords
 
-            extracted_results = []
+            extracted_results: list[tuple[CorpusPaper, list[str]]] = []
             max_workers = int(get_config_value(self.config, "executor.llm_workers"))
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-                futures = {pool.submit(extract_single, p): p for p in papers_to_extract}
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures: dict[Future[tuple[CorpusPaper, list[str]]], CorpusPaper] = {
+                    pool.submit(extract_single, p): p for p in papers_to_extract
+                }
                 for future in tqdm(
-                    concurrent.futures.as_completed(futures),
+                    as_completed(futures),
                     total=len(futures),
                     desc="Extracting keywords",
                 ):
@@ -441,15 +486,13 @@ class ArxivRetriever(BaseRetriever):
                         logger.warning(f"Failed to extract keywords: {e}")
 
             for paper, keywords in extracted_results:
-                cache_key = (
-                    f"{paper.title}|{paper.abstract[:50] if paper.abstract else ''}"
-                )
+                cache_key = make_content_key(paper.title, paper.abstract or "")
                 await db.save_keyword_cache(paper.title, paper.abstract or "", keywords)
                 cached_keywords[cache_key] = keywords
 
         total_docs = max(len(corpus_for_keywords), 1)
-        keyword_doc_freq = {}
-        keyword_weight = {}
+        keyword_doc_freq: dict[str, float] = {}
+        keyword_weight: dict[str, float] = {}
         for keyword in local_keywords:
             keyword_doc_freq[keyword] = keyword_doc_freq.get(keyword, 0) + 1
             keyword_weight[keyword] = keyword_weight.get(keyword, 0.0) + 1.25
@@ -461,7 +504,7 @@ class ArxivRetriever(BaseRetriever):
                     keyword_doc_freq[kw_lower] = keyword_doc_freq.get(kw_lower, 0) + 1
                     keyword_weight[kw_lower] = keyword_weight.get(kw_lower, 0.0) + 1.0
 
-        keyword_scores = []
+        keyword_scores: list[tuple[str, float, float]] = []
         for keyword, doc_freq in keyword_doc_freq.items():
             if total_docs >= 10 and doc_freq / total_docs > self.keyword_max_doc_freq:
                 continue
@@ -505,7 +548,7 @@ class ArxivRetriever(BaseRetriever):
         query = "+".join(categories)
         include_cross = bool(get_config_value(self.config, "source.arxiv.include_cross_list"))
 
-        feed = feedparser.parse(f"https://rss.arxiv.org/atom/{query}")
+        feed = _FEEDPARSER.parse(f"https://rss.arxiv.org/atom/{query}")
         if "Feed error for query" in feed.feed.get("title", ""):
             raise Exception(f"Invalid arxiv query: {query}")
 
@@ -562,7 +605,9 @@ class ArxivRetriever(BaseRetriever):
             max_workers=len(source_labels),
             desc="Collecting arXiv candidates",
         )
-        source_results = {label: papers for label, papers in candidate_sources}
+        source_results: dict[str, list[ArxivResult]] = {
+            label: papers for label, papers in candidate_sources
+        }
         rss_papers = source_results.get("rss", [])
         recent_papers = source_results.get("recent", [])
         candidate_pool = [
@@ -595,17 +640,17 @@ class ArxivRetriever(BaseRetriever):
             return []
 
         query = " OR ".join(f"cat:{category}" for category in categories)
-        search = arxiv.Search(
+        search = _ARXIV.Search(
             query=query,
             max_results=max_results,
-            sort_by=arxiv.SortCriterion.SubmittedDate,
+            sort_by=_ARXIV.SortCriterion.SubmittedDate,
         )
-        client = arxiv.Client(num_retries=5, delay_seconds=5)
+        client = _ARXIV.Client(num_retries=5, delay_seconds=5)
         now = datetime.now(timezone.utc)
         earliest = now - timedelta(days=lookback_days)
         latest = now - timedelta(days=start_days_ago)
 
-        papers = []
+        papers: list[ArxivResult] = []
         for result in client.results(search):
             published = getattr(result, "published", None)
             if published is None:
@@ -640,7 +685,7 @@ class ArxivRetriever(BaseRetriever):
         bm25_scores = _normalize_scores(bm25_scores)
         fallback_target = max(self.keyword_fallback_min_results, self.pre_rerank_limit)
 
-        def _recency_bonus(published) -> float:
+        def _recency_bonus(published: datetime | None) -> float:
             if published is None:
                 return 0.0
             published_utc = (
@@ -654,8 +699,8 @@ class ArxivRetriever(BaseRetriever):
             )
             return float(math.exp(-age_days / self.recency_half_life_days))
 
-        scored_papers = []
-        seen_ids = set()
+        scored_papers: list[tuple[float, float, float, float, float, RawPaper]] = []
+        seen_ids: set[str] = set()
         for paper in papers:
             match_score, match_count = _compute_keyword_match_score(paper, keywords)
             bm25_score = bm25_scores.get(_paper_entry_id(paper), 0.0)
@@ -685,7 +730,7 @@ class ArxivRetriever(BaseRetriever):
 
         matched_papers = [p for *_, p in scored_papers]
 
-        fallback_scored = []
+        fallback_scored: list[tuple[float, float, float, RawPaper]] = []
         for paper in papers:
             bm25_score = bm25_scores.get(_paper_entry_id(paper), 0.0)
             recency_bonus = _recency_bonus(_paper_published(paper))
@@ -745,21 +790,21 @@ class ArxivRetriever(BaseRetriever):
         if not paper_ids:
             return []
 
-        arxiv_client = arxiv.Client(num_retries=5, delay_seconds=5)
+        arxiv_client = _ARXIV.Client(num_retries=5, delay_seconds=5)
 
-        def fetch_batch(batch_ids):
-            search = arxiv.Search(id_list=batch_ids)
+        def fetch_batch(batch_ids: list[str]) -> list[ArxivResult]:
+            search = _ARXIV.Search(id_list=batch_ids)
             return list(arxiv_client.results(search))
 
         batches = [paper_ids[i : i + 20] for i in range(0, len(paper_ids), 20)]
         max_workers = int(get_config_value(self.config, "executor.arxiv_fetch_workers"))
         max_workers = min(max_workers, len(batches)) or 1
 
-        results = parallel_execute(
+        results: list[list[ArxivResult]] = parallel_execute(
             fetch_batch, batches, max_workers=max_workers, desc="Fetching paper details"
         )
 
-        raw_papers = []
+        raw_papers: list[ArxivResult] = []
         for batch_papers in results:
             if batch_papers:
                 raw_papers.extend(batch_papers)
@@ -769,12 +814,13 @@ class ArxivRetriever(BaseRetriever):
     def _rss_based_retrieval(self, categories: list[str]) -> list[RawPaper]:
         return self._collect_candidate_pool(categories)
 
+    @override
     def convert_to_paper(self, raw_paper: RawPaper) -> Paper:
         title = _paper_title(raw_paper)
-        authors = [str(author) for author in raw_paper.get("authors", [])]
+        authors = _raw_paper_authors(raw_paper)
         abstract = _paper_summary(raw_paper)
-        pdf_url = raw_paper.get("pdf_url")
-        code_url = raw_paper.get("code_url")
+        pdf_url = _raw_paper_text(raw_paper.get("pdf_url"))
+        code_url = _raw_paper_text(raw_paper.get("code_url"))
         published = _paper_published(raw_paper)
         retrieval_score = raw_paper.get("retrieval_score")
 
@@ -786,6 +832,6 @@ class ArxivRetriever(BaseRetriever):
             url=_paper_entry_id(raw_paper),
             pdf_url=pdf_url,
             code_url=code_url,
-            retrieval_score=float(retrieval_score) if retrieval_score is not None else None,
+            retrieval_score=_raw_paper_float(retrieval_score) if retrieval_score is not None else None,
             date=published.strftime("%Y-%m-%d") if published else None,
         )

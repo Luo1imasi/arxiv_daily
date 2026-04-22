@@ -2,10 +2,13 @@ import asyncio
 import os
 import tempfile
 import unittest
+from datetime import datetime
 
 from arxiv_daily import database as db
 from arxiv_daily.executor import _default_llm_metrics, _fallback_tldr, _filter_seen_papers
+from arxiv_daily.protocol import CorpusPaper
 from arxiv_daily.protocol import Paper
+from arxiv_daily.utils import make_content_key
 
 
 class FallbackTldrTests(unittest.TestCase):
@@ -79,6 +82,44 @@ class FilterSeenPapersTests(unittest.TestCase):
                 )
 
                 self.assertEqual([paper.title for paper in filtered], ["Fresh Title"])
+            finally:
+                if old_data_dir is None:
+                    os.environ.pop("ARXIV_DAILY_DATA", None)
+                else:
+                    os.environ["ARXIV_DAILY_DATA"] = old_data_dir
+
+
+class KeywordCacheTests(unittest.TestCase):
+    def test_load_keywords_for_papers_uses_content_key(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_data_dir = os.environ.get("ARXIV_DAILY_DATA")
+            os.environ["ARXIV_DAILY_DATA"] = tmpdir
+            try:
+                asyncio.run(db.init_db())
+                paper = CorpusPaper(
+                    title="Graph Attention for Agents",
+                    abstract="We study agent planning with graph attention.",
+                    added_date=datetime(2026, 4, 22),
+                )
+                asyncio.run(
+                    db.save_keyword_cache(
+                        paper.title,
+                        paper.abstract,
+                        ["graph attention", "agent planning"],
+                    )
+                )
+
+                cached = asyncio.run(db.load_keywords_for_papers([paper]))
+
+                self.assertEqual(
+                    cached,
+                    {
+                        make_content_key(paper.title, paper.abstract): [
+                            "graph attention",
+                            "agent planning",
+                        ]
+                    },
+                )
             finally:
                 if old_data_dir is None:
                     os.environ.pop("ARXIV_DAILY_DATA", None)

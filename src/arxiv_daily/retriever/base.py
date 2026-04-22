@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Type
+from typing import Any, Type
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from loguru import logger
 from tqdm import tqdm
@@ -9,19 +9,19 @@ from ..protocol import Paper, CorpusPaper
 class BaseRetriever(ABC):
     name: str
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict[str, Any]):
         self.config = config
         self._corpus: list[CorpusPaper] = []
 
-    def set_corpus(self, corpus: list[CorpusPaper]):
+    def set_corpus(self, corpus: list[CorpusPaper]) -> None:
         self._corpus = corpus
 
     @abstractmethod
-    def _retrieve_raw_papers(self) -> list:
+    def _retrieve_raw_papers(self) -> list[Any]:
         pass
 
     @abstractmethod
-    def convert_to_paper(self, raw_paper) -> Paper | None:
+    def convert_to_paper(self, raw_paper: Any) -> Paper | None:
         pass
 
     def retrieve_papers(self, corpus: list[CorpusPaper] | None = None) -> list[Paper]:
@@ -30,7 +30,10 @@ class BaseRetriever(ABC):
         raw_papers = self._retrieve_raw_papers()
         logger.info(f"Processing {len(raw_papers)} raw papers...")
 
-        max_workers = self.config.get("executor", {}).get("retriever_workers", 4)
+        executor_config = self.config.get("executor", {})
+        max_workers = 4
+        if isinstance(executor_config, dict):
+            max_workers = int(executor_config.get("retriever_workers", 4) or 4)
         papers = []
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:

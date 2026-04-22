@@ -1,6 +1,7 @@
 import os
 import json
 import aiosqlite
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Optional
 from pathlib import Path
@@ -99,11 +100,15 @@ _INIT_DB_SQL = """
 """
 
 
-async def _connect(db_path: Optional[str] = None, *, row_factory: bool = False) -> aiosqlite.Connection:
+@asynccontextmanager
+async def _connect(db_path: Optional[str] = None, *, row_factory: bool = False):
     db = await aiosqlite.connect(str(_get_db_path(db_path)))
     if row_factory:
         db.row_factory = aiosqlite.Row
-    return db
+    try:
+        yield db
+    finally:
+        await db.close()
 
 
 def _iter_chunks(values: list[str], size: int = 500):
@@ -149,7 +154,7 @@ def _get_db_path(config_path: Optional[str] = None) -> Path:
 async def init_db(db_path: Optional[str] = None):
     path = _get_db_path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    async with await _connect(db_path) as db:
+    async with _connect(db_path) as db:
         await db.execute("PRAGMA journal_mode=WAL")
         await db.executescript(_INIT_DB_SQL)
         await _ensure_cache_columns(db)
@@ -237,7 +242,7 @@ async def _backfill_content_keys(db: aiosqlite.Connection, table: str):
     cursor = await db.execute(
         f"SELECT id, title, abstract FROM {table} WHERE content_key IS NULL OR content_key = ''"
     )
-    rows = await cursor.fetchall()
+    rows = list(await cursor.fetchall())
     if not rows:
         return
 
@@ -248,8 +253,8 @@ async def _backfill_content_keys(db: aiosqlite.Connection, table: str):
     logger.info(f"Backfilled {len(rows)} content keys for {table}")
 
 
-async def save_papers(papers: list, date: str, db_path: Optional[str] = None):
-    async with await _connect(db_path) as db:
+async def save_papers(papers: list[Any], date: str, db_path: Optional[str] = None) -> None:
+    async with _connect(db_path) as db:
         await db.execute("DELETE FROM papers WHERE date = ?", (date,))
         data = []
         for p in papers:
@@ -284,14 +289,14 @@ async def create_task_run(
     db_path: Optional[str] = None,
 ) -> int:
     started_at = _utcnow_iso()
-    async with await _connect(db_path) as db:
+    async with _connect(db_path) as db:
         cursor = await db.execute(
             """INSERT INTO task_runs (task_name, trigger, status, metadata, started_at, updated_at)
                VALUES (?, ?, ?, ?, ?, ?)""",
             (task_name, trigger, "running", _json_dumps(metadata), started_at, started_at),
         )
         await db.commit()
-        return int(cursor.lastrowid)
+        return int(cursor.lastrowid or 0)
 
 
 async def complete_task_run(
@@ -302,7 +307,7 @@ async def complete_task_run(
     db_path: Optional[str] = None,
 ):
     finished_at = _utcnow_iso()
-    async with await _connect(db_path) as db:
+    async with _connect(db_path) as db:
         await db.execute(
             """UPDATE task_runs
                SET status = ?, error = ?, metrics = ?, finished_at = ?, updated_at = ?
@@ -313,7 +318,7 @@ async def complete_task_run(
 
 
 async def get_latest_task_run(db_path: Optional[str] = None) -> Optional[dict[str, Any]]:
-    async with await _connect(db_path, row_factory=True) as db:
+    async with _connect(db_path, row_factory=True) as db:
         cursor = await db.execute(
             "SELECT * FROM task_runs ORDER BY started_at DESC, id DESC LIMIT 1"
         )
@@ -325,7 +330,7 @@ async def load_candidate_cache(
     cache_key: str, db_path: Optional[str] = None
 ) -> Optional[list[dict[str, Any]]]:
     now_iso = _utcnow_iso()
-    async with await _connect(db_path) as db:
+    async with _connect(db_path) as db:
         cursor = await db.execute(
             "SELECT payload, expires_at FROM candidate_cache WHERE cache_key = ?",
             (cache_key,),
@@ -354,7 +359,7 @@ async def save_candidate_cache(
         datetime.utcnow().replace(microsecond=0)
         + timedelta(minutes=max(ttl_minutes, 1))
     ).isoformat()
-    async with await _connect(db_path) as db:
+    async with _connect(db_path) as db:
         await db.execute(
             """INSERT OR REPLACE INTO candidate_cache (cache_key, payload, created_at, expires_at)
                VALUES (?, ?, ?, ?)""",
@@ -373,7 +378,7 @@ async def load_candidate_enrichments(
     if not unique_urls:
         return {}
 
-    async with await _connect(db_path, row_factory=True) as db:
+    async with _connect(db_path, row_factory=True) as db:
         result: dict[str, dict[str, Any]] = {}
         rows = await _select_rows_by_values(
             db,
@@ -393,7 +398,7 @@ async def save_candidate_enrichments(
         return
 
     now_iso = _utcnow_iso()
-    async with await _connect(db_path, row_factory=True) as db:
+    async with _connect(db_path, row_factory=True) as db:
         data = []
         for entry in entries:
             url = entry.get("url")
@@ -441,8 +446,8 @@ async def save_candidate_enrichments(
     logger.info(f"Cached {len(payload)} candidate enrichment entries")
 
 
-async def get_papers_by_date(date: str, db_path: Optional[str] = None) -> list[dict]:
-    async with await _connect(db_path, row_factory=True) as db:
+async def get_papers_by_date(date: str, db_path: Optional[str] = None) -> list[dict[str, Any]]:
+    async with _connect(db_path, row_factory=True) as db:
         cursor = await db.execute(
             "SELECT * FROM papers WHERE date = ? ORDER BY score DESC",
             (date,),
@@ -452,17 +457,17 @@ async def get_papers_by_date(date: str, db_path: Optional[str] = None) -> list[d
 
 
 async def get_all_dates(db_path: Optional[str] = None) -> list[str]:
-    async with await _connect(db_path) as db:
+    async with _connect(db_path) as db:
         cursor = await db.execute("SELECT DISTINCT date FROM papers ORDER BY date DESC")
         rows = await cursor.fetchall()
         return [r[0] for r in rows]
 
 
 async def get_paper_count(db_path: Optional[str] = None) -> int:
-    async with await _connect(db_path) as db:
+    async with _connect(db_path) as db:
         cursor = await db.execute("SELECT COUNT(*) FROM papers")
         row = await cursor.fetchone()
-        return row[0]
+        return int(row[0]) if row else 0
 
 
 async def get_seen_paper_urls(
@@ -470,7 +475,7 @@ async def get_seen_paper_urls(
     *,
     exclude_date: Optional[str] = None,
 ) -> set[str]:
-    async with await _connect(db_path) as db:
+    async with _connect(db_path) as db:
         if exclude_date:
             cursor = await db.execute(
                 "SELECT DISTINCT url FROM papers WHERE url IS NOT NULL AND url != '' AND date != ?",
@@ -489,7 +494,7 @@ async def get_seen_paper_content_keys(
     *,
     exclude_date: Optional[str] = None,
 ) -> set[str]:
-    async with await _connect(db_path) as db:
+    async with _connect(db_path) as db:
         if exclude_date:
             cursor = await db.execute(
                 "SELECT title, abstract FROM papers WHERE date != ?",
@@ -507,14 +512,14 @@ async def get_seen_paper_content_keys(
 
 async def get_corpus_count(db_path: Optional[str] = None) -> int:
     """获取corpus缓存数量，避免加载全部数据"""
-    async with await _connect(db_path) as db:
+    async with _connect(db_path) as db:
         cursor = await db.execute("SELECT COUNT(*) FROM corpus_cache")
         row = await cursor.fetchone()
         return row[0] if row else 0
 
 
-async def save_corpus_cache(corpus: list, db_path: Optional[str] = None):
-    async with await _connect(db_path) as db:
+async def save_corpus_cache(corpus: list[CorpusPaper], db_path: Optional[str] = None) -> None:
+    async with _connect(db_path) as db:
         await db.execute("DELETE FROM corpus_cache")
         data = [
             (
@@ -541,7 +546,7 @@ async def save_corpus_cache(corpus: list, db_path: Optional[str] = None):
 async def save_keyword_cache(
     title: str, abstract: str, keywords: list[str], db_path: Optional[str] = None
 ):
-    async with await _connect(db_path) as db:
+    async with _connect(db_path) as db:
         await db.execute(
             """INSERT OR REPLACE INTO keyword_cache (title, abstract, content_key, keywords)
                VALUES (?, ?, ?, ?)""",
@@ -562,8 +567,8 @@ async def load_keywords_for_papers(
     if not papers:
         return {}
 
-    async with await _connect(db_path, row_factory=True) as db:
-        result = {}
+    async with _connect(db_path, row_factory=True) as db:
+        result: dict[str, list[str]] = {}
         key_map = {
             make_content_key(paper.title, paper.abstract or ""): paper
             for paper in papers
@@ -582,37 +587,35 @@ async def load_keywords_for_papers(
             paper = key_map.get(content_key)
             if not paper:
                 continue
-            result[_keyword_cache_key(paper.title, paper.abstract or "")] = json.loads(
-                row["keywords"]
-            )
+            result[content_key] = json.loads(row["keywords"])
         return result
 
 
 async def get_all_cached_keywords(
     db_path: Optional[str] = None,
 ) -> list[tuple[str, list[str]]]:
-    async with await _connect(db_path, row_factory=True) as db:
+    async with _connect(db_path, row_factory=True) as db:
         cursor = await db.execute("SELECT title, keywords FROM keyword_cache")
         rows = await cursor.fetchall()
         return [(r["title"], json.loads(r["keywords"])) for r in rows]
 
 
-async def load_corpus_cache(db_path: Optional[str] = None) -> list[dict]:
-    async with await _connect(db_path, row_factory=True) as db:
+async def load_corpus_cache(db_path: Optional[str] = None) -> list[CorpusPaper]:
+    async with _connect(db_path, row_factory=True) as db:
         cursor = await db.execute("SELECT * FROM corpus_cache")
         rows = await cursor.fetchall()
         return [_corpus_paper_from_row(row) for row in rows]
 
 
 async def save_embeddings(
-    papers: list,
-    embeddings: list,
+    papers: list[CorpusPaper],
+    embeddings: list[Any],
     model: str,
     db_path: Optional[str] = None,
-):
+) -> None:
     import pickle
 
-    async with await _connect(db_path) as db:
+    async with _connect(db_path) as db:
         data = [
             (
                 p.title,
@@ -633,21 +636,21 @@ async def save_embeddings(
 
 
 async def load_embeddings(
-    papers: list, model: str, db_path: Optional[str] = None
-) -> tuple[list[int], list]:
+    papers: list[CorpusPaper], model: str, db_path: Optional[str] = None
+) -> tuple[list[int], list[Any]]:
     import pickle
 
     if not papers:
         return [], []
 
-    async with await _connect(db_path, row_factory=True) as db:
-        key_to_indices = {}
+    async with _connect(db_path, row_factory=True) as db:
+        key_to_indices: dict[str, list[int]] = {}
         for i, paper in enumerate(papers):
             content_key = make_content_key(paper.title, paper.abstract or "")
             key_to_indices.setdefault(content_key, []).append(i)
 
         indices = []
-        embeddings = []
+        embeddings: list[Any] = []
         content_keys = list(key_to_indices.keys())
         for chunk in _iter_chunks(content_keys):
             placeholders = ", ".join("?" for _ in chunk)

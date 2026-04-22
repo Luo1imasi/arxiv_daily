@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Optional
 from loguru import logger
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .protocol import CorpusPaper
 from .utils import parallel_execute
