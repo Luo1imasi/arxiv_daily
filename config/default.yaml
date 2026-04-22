@@ -1,0 +1,64 @@
+webdav:
+  url: ""
+  username: ""
+  password: ""
+  path: "/papers/"
+  local_path: ""
+
+source:
+  arxiv:
+    category: ["cs.AI", "cs.CV", "cs.LG", "cs.CL", "cs.RO", "cs.SY"]
+    include_cross_list: false
+    use_keyword_search: false
+    max_keywords: 10
+    keyword_corpus_limit: 300
+    keyword_max_doc_freq: 0.6
+    candidate_cache_ttl_minutes: 180
+    keyword_fallback_min_results: 20
+    pre_rerank_limit: 120
+    use_bm25_scoring: true
+    min_keyword_matches: 1
+    recent_days: 14
+    max_recent_days: 140
+    recent_max_results: 200
+    recency_half_life_days: 14
+    lookback_score_threshold: 7.0
+
+llm:
+  api_key: ""
+  base_url: "https://api.openai.com/v1"
+  model: "gpt-4o-mini"
+  language: "Chinese"
+  timeout: 60.0
+  max_retries: 3
+  base_delay: 1.0
+
+reranker:
+  model: "jinaai/jina-embeddings-v5-text-nano"
+  top_k: 20
+  score_batch_size: 256
+  relevance_weight: 0.7
+  novelty_weight: 0.15
+  recency_weight: 0.15
+  retrieval_weight: 0.2
+  pre_mmr_candidate_factor: 4
+  mmr_lambda: 0.78
+  recency_half_life_days: 7.0
+  encode_kwargs:
+    task: "retrieval"
+    prompt_name: "document"
+
+executor:
+  max_paper_num: 20
+  source: ["arxiv"]
+  timezone: "Asia/Shanghai"
+  schedule_hour: 8
+  schedule_minute: 0
+  manifest_ttl_minutes: 30
+  retriever_workers: 4
+  llm_workers: 4
+  arxiv_fetch_workers: 4
+
+server:
+  host: "0.0.0.0"
+  port: 5555

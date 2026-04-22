@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arxiv-daily"
+version = "1.0.0"
+description = "Recommend new arxiv papers daily based on your WebDAV paper library, displayed on a web interface."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "jinja2>=3.1.0",
+    "webdav4>=0.10.0",
+    "requests>=2.32.0",
+    "arxiv>=2.4.0",
+    "feedparser>=6.0.11",
+    "numpy>=1.26.0",
+    "openai>=1.40.0",
+    "pymupdf>=1.24.0",
+    "pymupdf4llm>=0.3.4",
+    "trafilatura>=2.0.0",
+    "tqdm>=4.66.0",
+    "loguru>=0.7.3",
+    "pyyaml>=6.0",
+    "apscheduler>=3.10.0",
+    "aiosqlite>=0.20.0",
+    "sentence-transformers>=3.0.0",
+    "torch>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.6.0",
+]
+
+[project.scripts]
+arxiv-daily = "arxiv_daily.main:main"
+
+[tool.setuptools.package-data]
+arxiv_daily = ["templates/*.html", "static/*.css"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

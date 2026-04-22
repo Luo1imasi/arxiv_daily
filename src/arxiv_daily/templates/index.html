@@ -1,0 +1,683 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>arXiv Daily - Paper Recommendations</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <nav class="navbar">
+        <div class="nav-brand">
+            <span class="logo">arXiv Daily</span>
+        </div>
+        <div class="nav-links">
+            <a href="/" class="nav-link {% if not current_date %}active{% endif %}">Home</a>
+            <button type="button" class="nav-link nav-button" onclick="openSettings()">Settings</button>
+            <button class="btn btn-primary" onclick="triggerRun()" id="runBtn">
+                Run Now
+            </button>
+        </div>
+    </nav>
+
+    <div class="container">
+        <aside class="sidebar">
+            <div class="stats-card">
+                <h3>Stats</h3>
+                <div id="stats-content">Loading...</div>
+            </div>
+            <div class="dates-card">
+                <h3>Dates</h3>
+                <ul class="dates-list" id="dates-list">
+                    {% for d in dates %}
+                    <li>
+                        <a href="/date/{{ d }}" class="date-link {% if d == current_date %}active{% endif %}">
+                            {{ d }}
+                        </a>
+                    </li>
+                    {% endfor %}
+                    {% if not dates %}
+                    <li class="no-dates">No papers yet. Run a task to get started.</li>
+                    {% endif %}
+                </ul>
+            </div>
+        </aside>
+
+        <main class="content">
+            <div class="alert alert-info task-banner {% if not task_running %}hidden{% endif %}" id="taskBanner">
+                <div class="task-banner-content">
+                    <span class="spinner"></span>
+                    <span id="taskBannerText" class="task-banner-text">A task is currently running...</span>
+                </div>
+            </div>
+
+            {% if current_date %}
+            <div class="date-header">
+                <h2>Papers for {{ current_date }}</h2>
+                <span class="paper-count">{{ papers|length }} papers</span>
+            </div>
+            {% endif %}
+
+            {% if not papers and not current_date %}
+            <div class="empty-state">
+                <span class="empty-state-kicker">Daily discovery, tuned to your library</span>
+                <h2>Welcome to arXiv Daily</h2>
+                <p>This tool recommends new arXiv papers based on your local or WebDAV paper library.</p>
+                <div class="empty-state-actions">
+                    <button type="button" class="btn btn-primary" onclick="triggerRun()">Run Now</button>
+                    <button type="button" class="btn btn-secondary" onclick="openSettings()">Open Settings</button>
+                </div>
+                <ol>
+                    <li>Configure your WebDAV settings (click <strong>Settings</strong>)</li>
+                    <li>Make sure your PDF papers are stored on WebDAV</li>
+                    <li>Click <strong>Run Now</strong> to start fetching and analyzing papers</li>
+                </ol>
+            </div>
+            {% elif not papers and current_date %}
+            <div class="empty-state">
+                <h2>No papers found for {{ current_date }}</h2>
+                <p>Try running a new task or selecting a different date.</p>
+            </div>
+            {% endif %}
+
+            {% for paper in papers %}
+            <div class="paper-card" data-score="{{ paper.score or 0 }}">
+                <div class="paper-header">
+                    <h3 class="paper-title">
+                        <a href="{{ paper.url }}" target="_blank" rel="noopener noreferrer">{{ paper.title }}</a>
+                    </h3>
+                    <span class="paper-score">{{ "%.1f"|format(paper.score or 0) }}</span>
+                </div>
+
+                <div class="paper-meta">
+                    <span class="paper-authors">
+                        {% set authors = paper.authors|from_json if paper.authors is string else paper.authors %}
+                        {% if authors %}
+                            {% if authors|length <= 5 %}
+                                {{ authors|join(", ") }}
+                            {% else %}
+                                {{ authors[:3]|join(", ") }}, ... , {{ authors[-2:]|join(", ") }}
+                            {% endif %}
+                        {% endif %}
+                    </span>
+                </div>
+
+                {% if paper.tldr %}
+                <div class="paper-tldr">
+                    <strong>一句话总结：</strong> {{ paper.tldr }}
+                </div>
+                {% endif %}
+
+                {% if paper.abstract and not paper.tldr %}
+                <div class="paper-abstract">
+                    {{ paper.abstract[:500] }}{% if paper.abstract|length > 500 %}...{% endif %}
+                </div>
+                {% endif %}
+
+                <div class="paper-links">
+                    {% if paper.pdf_url %}
+                    <a href="{{ paper.pdf_url }}" target="_blank" rel="noopener noreferrer" class="btn-link btn-pdf">PDF</a>
+                    {% endif %}
+                    <a href="{{ paper.url }}" target="_blank" rel="noopener noreferrer" class="btn-link btn-abs">Abstract</a>
+                    {% if paper.code_url %}
+                    <a href="{{ paper.code_url }}" target="_blank" rel="noopener noreferrer" class="btn-link btn-code">Code</a>
+                    {% endif %}
+                </div>
+            </div>
+            {% endfor %}
+        </main>
+    </div>
+
+    <div class="modal-overlay" id="settingsModal" onclick="handleModalOverlayClick(event)">
+        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+            <div class="modal-header">
+                <h2 id="settingsTitle">Settings</h2>
+                <button type="button" class="modal-close" onclick="closeSettings()" aria-label="Close settings">&times;</button>
+            </div>
+            <div class="modal-body">
+                <form id="settingsForm" onsubmit="saveSettings(event)">
+                    <div class="form-section">
+                        <h3>Library Source</h3>
+                        <div class="form-group">
+                            <label>Local Path (optional, takes priority if set)</label>
+                            <input type="text" name="webdav_local_path" id="cfg_webdav_local_path" placeholder="/mnt/webdav/zotero or leave empty to use WebDAV URL">
+                        </div>
+                        <div class="form-group">
+                            <label>WebDAV URL (used if local path not set)</label>
+                            <input type="url" name="webdav_url" id="cfg_webdav_url" placeholder="https://your-webdav-server.com/dav">
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>Username</label>
+                                <input type="text" name="webdav_username" id="cfg_webdav_username">
+                            </div>
+                            <div class="form-group">
+                                <label>Password</label>
+                                <input type="password" name="webdav_password" id="cfg_webdav_password">
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>Remote Path</label>
+                            <input type="text" name="webdav_path" id="cfg_webdav_path" value="/papers">
+                        </div>
+                        <div class="button-row">
+                            <button type="button" class="btn btn-secondary" onclick="testWebDAV()">Validate Source</button>
+                            <button type="button" class="btn btn-secondary" onclick="reloadCorpus()" id="reloadCorpusBtn">Reload Corpus</button>
+                        </div>
+                        <span id="webdav-test-result"></span>
+                    </div>
+
+                    <div class="form-section">
+                        <h3>arXiv Retrieval</h3>
+                        <div class="form-group">
+                            <label>Categories (comma separated)</label>
+                            <input type="text" name="arxiv_category" id="cfg_arxiv_category" placeholder="cs.AI, cs.CV, cs.LG, cs.CL">
+                        </div>
+                        <div class="form-group">
+                            <label>
+                                <input type="checkbox" name="arxiv_cross_list" id="cfg_arxiv_cross_list">
+                                Include cross-listed papers
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="form-section">
+                        <h3>LLM API (for TLDR generation)</h3>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>API Key</label>
+                                <input type="password" name="llm_api_key" id="cfg_llm_api_key">
+                            </div>
+                            <div class="form-group">
+                                <label>Base URL</label>
+                                <input type="url" name="llm_base_url" id="cfg_llm_base_url" value="https://api.openai.com/v1">
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>Model</label>
+                                <input type="text" name="llm_model" id="cfg_llm_model" value="gpt-4o-mini">
+                            </div>
+                            <div class="form-group">
+                                <label>Language</label>
+                                <input type="text" name="llm_language" id="cfg_llm_language" value="Chinese">
+                            </div>
+                        </div>
+                        <button type="button" class="btn btn-secondary" onclick="testLLM()">Test Connection</button>
+                        <span id="llm-test-result"></span>
+                    </div>
+
+                    <div class="form-section">
+                        <h3>Schedule</h3>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>Timezone</label>
+                                <select name="timezone" id="cfg_timezone">
+                                    <option value="Asia/Shanghai">Asia/Shanghai (CST +8)</option>
+                                    <option value="UTC">UTC</option>
+                                    <option value="America/New_York">America/New_York (EST -5)</option>
+                                    <option value="America/Los_Angeles">America/Los_Angeles (PST -8)</option>
+                                    <option value="Europe/London">Europe/London (GMT +0)</option>
+                                    <option value="Europe/Berlin">Europe/Berlin (CET +1)</option>
+                                    <option value="Asia/Tokyo">Asia/Tokyo (JST +9)</option>
+                                    <option value="Asia/Hong_Kong">Asia/Hong_Kong (HKT +8)</option>
+                                    <option value="Asia/Singapore">Asia/Singapore (SGT +8)</option>
+                                    <option value="Australia/Sydney">Australia/Sydney (AEST +10)</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label>Hour (0-23)</label>
+                                <input type="number" name="schedule_hour" id="cfg_schedule_hour" value="8" min="0" max="23">
+                            </div>
+                            <div class="form-group">
+                                <label>Minute (0-59)</label>
+                                <input type="number" name="schedule_minute" id="cfg_schedule_minute" value="0" min="0" max="59">
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="form-section">
+                        <h3>Recommendations</h3>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>Max Paper Number</label>
+                                <input type="number" name="max_paper_num" id="cfg_max_paper_num" value="100" min="1" max="1000">
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="form-actions">
+                        <button type="submit" class="btn btn-primary">Save Settings</button>
+                        <button type="button" class="btn btn-secondary" onclick="closeSettings()">Cancel</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+
+    <script>
+    const API_BASE = '';
+    let statusPollTimer = null;
+    let lastFocusedElement = null;
+
+    function getInputInt(id, fallback) {
+        const value = parseInt(document.getElementById(id).value, 10);
+        return Number.isNaN(value) ? fallback : value;
+    }
+
+    async function parseResponse(resp) {
+        const contentType = resp.headers.get('content-type') || '';
+        if (contentType.includes('application/json')) {
+            return await resp.json();
+        }
+
+        const text = await resp.text();
+        if (!resp.ok) {
+            throw new Error(text || `Request failed with status ${resp.status}`);
+        }
+        return text ? { detail: text } : {};
+    }
+
+    async function fetchJson(url, options) {
+        const resp = await fetch(url, options);
+        const data = await parseResponse(resp);
+        return { resp, data };
+    }
+
+    function setTaskState(data = {}) {
+        const running = Boolean(data.running);
+        const taskName = data.task_name || 'task';
+        const runBtn = document.getElementById('runBtn');
+        const reloadBtn = document.getElementById('reloadCorpusBtn');
+        const banner = document.getElementById('taskBanner');
+        const bannerText = document.getElementById('taskBannerText');
+
+        runBtn.disabled = running;
+        if (reloadBtn) reloadBtn.disabled = running;
+
+        if (running) {
+            runBtn.textContent = 'Running...';
+            banner.classList.remove('hidden');
+            bannerText.textContent = `${taskName} is running...`;
+        } else {
+            runBtn.textContent = 'Run Now';
+            banner.classList.add('hidden');
+            bannerText.textContent = 'No task is running.';
+        }
+    }
+
+    async function fetchTaskStatus(showErrors=false) {
+        try {
+            const { data } = await fetchJson(API_BASE + '/api/status');
+            setTaskState(data);
+            if (showErrors && data.error && !data.running) {
+                showToast('Last task failed: ' + data.error, 'error', 0);
+            }
+            return data;
+        } catch (e) {
+            if (showErrors) {
+                showToast('Error checking status: ' + e.message, 'error');
+            }
+            return null;
+        }
+    }
+
+    function showToast(msg, type='info', duration=0) {
+        const toast = document.getElementById('toast');
+        toast.textContent = msg;
+        toast.className = 'toast toast-' + type + ' toast-show';
+        const ms = duration || (type === 'error' ? 30000 : 3000);
+        if (toast._timer) clearTimeout(toast._timer);
+        if (ms > 0) {
+            toast._timer = setTimeout(() => toast.className = 'toast', ms);
+        }
+    }
+
+    async function triggerRun() {
+        setTaskState({running: true, task_name: 'daily recommendation'});
+        try {
+            const { resp, data } = await fetchJson(API_BASE + '/api/run', {method: 'POST'});
+            if (resp.ok) {
+                showToast('Task started! This may take a few minutes.', 'success');
+                pollStatus();
+            } else {
+                showToast(data.detail || 'Failed to start task', 'error');
+                await fetchTaskStatus();
+            }
+        } catch(e) {
+            showToast('Error: ' + e.message, 'error');
+            await fetchTaskStatus();
+        }
+    }
+
+    async function pollStatus() {
+        if (statusPollTimer) {
+            clearTimeout(statusPollTimer);
+            statusPollTimer = null;
+        }
+        const check = async () => {
+            try {
+                const data = await fetchTaskStatus();
+                if (!data) {
+                    statusPollTimer = setTimeout(check, 5000);
+                    return;
+                }
+                if (data.running) {
+                    statusPollTimer = setTimeout(check, 3000);
+                } else if (data.done) {
+                    if (data.error) {
+                        showToast((data.task_name || 'Task') + ' failed: ' + data.error, 'error', 0);
+                    } else {
+                        showToast((data.task_name || 'Task') + ' completed! Reloading...', 'success');
+                        setTimeout(() => location.reload(), 1000);
+                    }
+                } else if (data.error) {
+                    showToast('Last task failed: ' + data.error, 'error', 0);
+                }
+            } catch(e) {
+                statusPollTimer = setTimeout(check, 5000);
+            }
+        };
+        statusPollTimer = setTimeout(check, 2000);
+    }
+
+    async function checkStatus() {
+        const data = await fetchTaskStatus(true);
+        if (!data) {
+            return;
+        }
+        if (data.running) {
+            showToast((data.task_name || 'Task') + ' is still running...', 'info');
+        } else if (data.done) {
+            if (data.error) {
+                showToast((data.task_name || 'Task') + ' failed: ' + data.error, 'error', 0);
+            } else {
+                showToast((data.task_name || 'Task') + ' completed!', 'success');
+                setTimeout(() => location.reload(), 1000);
+            }
+        }
+    }
+
+    function openSettings() {
+        lastFocusedElement = document.activeElement;
+        loadSettingsToForm();
+        const modal = document.getElementById('settingsModal');
+        modal.classList.add('active');
+        document.body.classList.add('modal-open');
+
+        const firstField = modal.querySelector('input, select, button');
+        if (firstField) {
+            setTimeout(() => firstField.focus(), 0);
+        }
+    }
+
+    function closeSettings() {
+        document.getElementById('settingsModal').classList.remove('active');
+        document.body.classList.remove('modal-open');
+        if (lastFocusedElement instanceof HTMLElement) {
+            lastFocusedElement.focus();
+        }
+    }
+
+    function handleModalOverlayClick(event) {
+        if (event.target.id === 'settingsModal') {
+            closeSettings();
+        }
+    }
+
+    async function loadSettingsToForm() {
+        try {
+            const { data: cfg } = await fetchJson(API_BASE + '/api/config');
+            document.getElementById('cfg_webdav_local_path').value = cfg.webdav?.local_path || '';
+            document.getElementById('cfg_webdav_url').value = cfg.webdav?.url || '';
+            document.getElementById('cfg_webdav_username').value = cfg.webdav?.username || '';
+            document.getElementById('cfg_webdav_password').value = '';
+            document.getElementById('cfg_webdav_path').value = cfg.webdav?.path || '/papers';
+            document.getElementById('cfg_arxiv_category').value = (cfg.source?.arxiv?.category || []).join(', ');
+            document.getElementById('cfg_arxiv_cross_list').checked = cfg.source?.arxiv?.include_cross_list || false;
+            document.getElementById('cfg_llm_api_key').value = '';
+            document.getElementById('cfg_llm_base_url').value = cfg.llm?.base_url || 'https://api.openai.com/v1';
+            document.getElementById('cfg_llm_model').value = cfg.llm?.model || 'gpt-4o-mini';
+            document.getElementById('cfg_llm_language').value = cfg.llm?.language || 'Chinese';
+            document.getElementById('cfg_schedule_hour').value = cfg.executor?.schedule_hour ?? 8;
+            document.getElementById('cfg_schedule_minute').value = cfg.executor?.schedule_minute ?? 0;
+            document.getElementById('cfg_max_paper_num').value = cfg.executor?.max_paper_num ?? 100;
+            document.getElementById('cfg_timezone').value = cfg.executor?.timezone || 'Asia/Shanghai';
+        } catch(e) {
+            console.error('Failed to load settings:', e);
+        }
+    }
+
+    async function saveSettings(e) {
+        e.preventDefault();
+        const categories = document.getElementById('cfg_arxiv_category').value
+            .split(',').map(s => s.trim()).filter(Boolean);
+
+        const config = {
+            webdav: {
+                local_path: document.getElementById('cfg_webdav_local_path').value || '',
+                url: document.getElementById('cfg_webdav_url').value,
+                username: document.getElementById('cfg_webdav_username').value,
+                password: document.getElementById('cfg_webdav_password').value || undefined,
+                path: document.getElementById('cfg_webdav_path').value || '/papers',
+            },
+            source: {
+                arxiv: {
+                    category: categories,
+                    include_cross_list: document.getElementById('cfg_arxiv_cross_list').checked,
+                }
+            },
+            llm: {
+                api_key: document.getElementById('cfg_llm_api_key').value || undefined,
+                base_url: document.getElementById('cfg_llm_base_url').value,
+                model: document.getElementById('cfg_llm_model').value,
+                language: document.getElementById('cfg_llm_language').value,
+            },
+            executor: {
+                max_paper_num: getInputInt('cfg_max_paper_num', 100),
+                timezone: document.getElementById('cfg_timezone').value || 'Asia/Shanghai',
+                schedule_hour: getInputInt('cfg_schedule_hour', 8),
+                schedule_minute: getInputInt('cfg_schedule_minute', 0),
+                source: ['arxiv'],
+            }
+        };
+
+        try {
+            const { resp } = await fetchJson(API_BASE + '/api/config', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(config),
+            });
+            if (resp.ok) {
+                showToast('Settings saved!', 'success');
+                closeSettings();
+            } else {
+                showToast('Failed to save settings', 'error');
+            }
+        } catch(e) {
+            showToast('Error: ' + e.message, 'error');
+        }
+    }
+
+    async function testWebDAV() {
+        const result = document.getElementById('webdav-test-result');
+        result.textContent = 'Testing...';
+        result.className = '';
+        const localPath = document.getElementById('cfg_webdav_local_path').value;
+        try {
+            const { data } = await fetchJson(API_BASE + '/api/webdav/test', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    local_path: localPath,
+                    url: document.getElementById('cfg_webdav_url').value,
+                    username: document.getElementById('cfg_webdav_username').value,
+                    password: document.getElementById('cfg_webdav_password').value,
+                    path: document.getElementById('cfg_webdav_path').value,
+                }),
+            });
+            if (data.success) {
+                result.textContent = data.mode === 'local'
+                    ? 'Local path is available.'
+                    : 'WebDAV connection successful!';
+                result.className = 'text-success';
+            } else {
+                result.textContent = data.mode === 'local'
+                    ? 'Local path is not accessible.'
+                    : 'WebDAV connection failed!';
+                result.className = 'text-error';
+            }
+        } catch(e) {
+            result.textContent = 'Error: ' + e.message;
+            result.className = 'text-error';
+        }
+    }
+
+    async function reloadCorpus() {
+        try {
+            setTaskState({running: true, task_name: 'corpus reload'});
+            const { resp, data } = await fetchJson(API_BASE + '/api/corpus/reload', {method: 'POST'});
+            if (resp.ok) {
+                showToast('Corpus reload started. This may take a while.', 'success');
+                pollStatus();
+            } else {
+                showToast(data.detail || 'Failed to reload corpus', 'error');
+                await fetchTaskStatus();
+            }
+        } catch (e) {
+            showToast('Error: ' + e.message, 'error');
+            await fetchTaskStatus();
+        }
+    }
+
+    async function testLLM() {
+        const result = document.getElementById('llm-test-result');
+        result.textContent = 'Testing...';
+        result.className = '';
+        try {
+            const { data } = await fetchJson(API_BASE + '/api/llm/test', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    api_key: document.getElementById('cfg_llm_api_key').value,
+                    base_url: document.getElementById('cfg_llm_base_url').value,
+                    model: document.getElementById('cfg_llm_model').value,
+                }),
+            });
+            if (data.success) {
+                result.textContent = 'Connection successful!';
+                result.className = 'text-success';
+            } else {
+                result.textContent = 'Connection failed!';
+                result.className = 'text-error';
+            }
+        } catch(e) {
+            result.textContent = 'Error: ' + e.message;
+            result.className = 'text-error';
+        }
+    }
+
+    (async function loadStats() {
+        try {
+            const { data: stats } = await fetchJson(API_BASE + '/api/stats');
+            const container = document.getElementById('stats-content');
+            container.innerHTML = '';
+
+            const entries = [
+                [String(stats.corpus_size), 'corpus papers'],
+                [String(stats.total_dates), 'days tracked'],
+                [String(stats.total_papers), 'total papers'],
+            ];
+
+            for (const [value, label] of entries) {
+                const item = document.createElement('div');
+                item.className = 'stat-item';
+                const strong = document.createElement('strong');
+                strong.textContent = value;
+                item.appendChild(strong);
+                const text = document.createElement('span');
+                text.textContent = label;
+                item.appendChild(text);
+                container.appendChild(item);
+            }
+
+            if (stats.latest_date) {
+                const item = document.createElement('div');
+                item.className = 'stat-item';
+                item.append('Latest: ');
+                const strong = document.createElement('strong');
+                strong.textContent = stats.latest_date;
+                item.appendChild(strong);
+                container.appendChild(item);
+            }
+
+            if (stats.latest_run) {
+                const run = stats.latest_run;
+                const item = document.createElement('div');
+                item.className = 'stat-item';
+                const status = document.createElement('strong');
+                status.textContent = run.status;
+                item.append('Last run: ');
+                item.appendChild(status);
+                if (run.task_name) {
+                    item.append(` (${run.task_name})`);
+                }
+                container.appendChild(item);
+
+                if (run.finished_at_display || run.started_at_display || run.finished_at || run.started_at) {
+                    const timeItem = document.createElement('div');
+                    timeItem.className = 'stat-item';
+                    const startedAt = run.started_at_display || run.started_at || 'unknown';
+                    const tzLabel = run.display_timezone ? ` (${run.display_timezone})` : '';
+                    timeItem.textContent = `Started: ${startedAt}${tzLabel}`;
+                    container.appendChild(timeItem);
+
+                    if (run.finished_at_display || run.finished_at) {
+                        const finishedItem = document.createElement('div');
+                        finishedItem.className = 'stat-item';
+                        finishedItem.textContent = `Finished: ${run.finished_at_display || run.finished_at}${tzLabel}`;
+                        container.appendChild(finishedItem);
+                    }
+                }
+
+                if (run.duration_seconds != null) {
+                    const durationItem = document.createElement('div');
+                    durationItem.className = 'stat-item';
+                    durationItem.textContent = `Duration: ${run.duration_seconds}s`;
+                    container.appendChild(durationItem);
+                }
+
+                if (run.metrics?.final_recommendations != null) {
+                    const metricsItem = document.createElement('div');
+                    metricsItem.className = 'stat-item';
+                    metricsItem.textContent = `Recommended: ${run.metrics.final_recommendations}`;
+                    container.appendChild(metricsItem);
+                } else if (run.metrics?.corpus_count != null) {
+                    const metricsItem = document.createElement('div');
+                    metricsItem.className = 'stat-item';
+                    metricsItem.textContent = `Corpus loaded: ${run.metrics.corpus_count}`;
+                    container.appendChild(metricsItem);
+                }
+            }
+        } catch(e) {
+            document.getElementById('stats-content').textContent = 'Failed to load stats';
+        }
+    })();
+
+    (async function initPageState() {
+        const data = await fetchTaskStatus(true);
+        if (data?.running) {
+            pollStatus();
+        }
+    })();
+
+    document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape' && document.getElementById('settingsModal').classList.contains('active')) {
+            closeSettings();
+        }
+    });
+    </script>
+</body>
+</html>

@@ -1,0 +1,32 @@
+webdav:
+  url: "https://your-webdav-server.example/dav"
+  username: ""
+  password: ""
+  path: "/papers/"
+  local_path: ""
+
+source:
+  arxiv:
+    use_keyword_search: true
+    max_keywords: 15
+    recent_days: 7
+    max_recent_days: 30
+    recency_half_life_days: 7
+    lookback_score_threshold: 7.0
+    recent_max_results: 250
+
+llm:
+  api_key: ""
+  base_url: "https://api.openai.com/v1"
+  model: "gpt-4o-mini"
+  language: "Chinese"
+
+reranker:
+  mmr_lambda: 0.78
+
+executor:
+  manifest_ttl_minutes: 30
+
+server:
+  host: "0.0.0.0"
+  port: 5555
