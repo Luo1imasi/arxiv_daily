@@ -2,7 +2,7 @@ import os
 import json
 import aiosqlite
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Optional
 from pathlib import Path
 from loguru import logger
@@ -103,6 +103,7 @@ _INIT_DB_SQL = """
 @asynccontextmanager
 async def _connect(db_path: Optional[str] = None, *, row_factory: bool = False):
     db = await aiosqlite.connect(str(_get_db_path(db_path)))
+    await db.execute("PRAGMA busy_timeout = 5000")
     if row_factory:
         db.row_factory = aiosqlite.Row
     try:
@@ -166,7 +167,7 @@ async def init_db(db_path: Optional[str] = None):
 
 
 def _utcnow_iso() -> str:
-    return datetime.utcnow().replace(microsecond=0).isoformat()
+    return datetime.now(UTC).replace(microsecond=0).isoformat()
 
 
 def _json_dumps(value: Optional[dict[str, Any]]) -> Optional[str]:
@@ -353,10 +354,8 @@ async def save_candidate_cache(
     db_path: Optional[str] = None,
 ):
     created_at = _utcnow_iso()
-    from datetime import timedelta
-
     expires_at = (
-        datetime.utcnow().replace(microsecond=0)
+        datetime.now(UTC).replace(microsecond=0)
         + timedelta(minutes=max(ttl_minutes, 1))
     ).isoformat()
     async with _connect(db_path) as db:
@@ -474,9 +473,15 @@ async def get_seen_paper_urls(
     db_path: Optional[str] = None,
     *,
     exclude_date: Optional[str] = None,
+    before_date: Optional[str] = None,
 ) -> set[str]:
     async with _connect(db_path) as db:
-        if exclude_date:
+        if before_date:
+            cursor = await db.execute(
+                "SELECT DISTINCT url FROM papers WHERE url IS NOT NULL AND url != '' AND date < ?",
+                (before_date,),
+            )
+        elif exclude_date:
             cursor = await db.execute(
                 "SELECT DISTINCT url FROM papers WHERE url IS NOT NULL AND url != '' AND date != ?",
                 (exclude_date,),
@@ -493,9 +498,15 @@ async def get_seen_paper_content_keys(
     db_path: Optional[str] = None,
     *,
     exclude_date: Optional[str] = None,
+    before_date: Optional[str] = None,
 ) -> set[str]:
     async with _connect(db_path) as db:
-        if exclude_date:
+        if before_date:
+            cursor = await db.execute(
+                "SELECT title, abstract FROM papers WHERE date < ?",
+                (before_date,),
+            )
+        elif exclude_date:
             cursor = await db.execute(
                 "SELECT title, abstract FROM papers WHERE date != ?",
                 (exclude_date,),
