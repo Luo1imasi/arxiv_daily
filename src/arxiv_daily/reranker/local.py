@@ -3,6 +3,8 @@ import hashlib
 import json
 import logging
 import warnings
+from datetime import datetime, timezone
+
 import numpy as np
 from loguru import logger
 
@@ -10,6 +12,7 @@ from .base import BaseReranker, register_reranker
 from .. import database as db
 from ..config import get_config_value
 from ..utils import make_content_key
+from ..business_date import reference_datetime as _reference_datetime
 
 _model_cache: dict[str, object] = {}
 _corpus_feature_cache: dict[str, dict[str, object]] = {}
@@ -66,6 +69,18 @@ def _normalize_scores(scores: np.ndarray) -> np.ndarray:
     if max_score <= min_score:
         return np.zeros(scores.shape[0], dtype=np.float32)
     return (scores - min_score) / (max_score - min_score)
+
+
+def _display_scores(scores: list[float]) -> list[float]:
+    if not scores:
+        return []
+
+    raw = np.asarray(scores, dtype=np.float32)
+    normalized = _normalize_scores(raw)
+    if float(np.max(normalized)) <= 0.0:
+        return [5.0 for _ in scores]
+
+    return [float(4.0 + value * 6.0) for value in normalized]
 
 
 def _compute_topk_stats(
@@ -177,8 +192,9 @@ class LocalReranker(BaseReranker):
         order, mmr_scores = self._mmr_order(base_scores, candidate_sim, max_paper_num)
 
         reranked = [candidates[i] for i in order]
+        display_scores = _display_scores(mmr_scores)
         for rank, idx in enumerate(order):
-            candidates[idx].score = float((mmr_scores[rank] + 1.0) * 10)
+            candidates[idx].score = display_scores[rank]
         return reranked
 
     def _get_corpus_features(
@@ -258,14 +274,12 @@ class LocalReranker(BaseReranker):
         if not published_date:
             return 0.0
         try:
-            from datetime import datetime, timezone
-
             published = datetime.strptime(published_date, "%Y-%m-%d").replace(
                 tzinfo=timezone.utc
             )
             age_days = max(
-                (datetime.now(timezone.utc) - published).total_seconds() / 86400.0,
-                0.0,
+                (_reference_datetime(self.config).date() - published.date()).days,
+                0,
             )
             half_life = max(
                 float(get_config_value(self.config, "reranker.recency_half_life_days")),
