@@ -65,6 +65,8 @@ http://127.0.0.1:5555
 
 更完整的参数说明可以直接看 `config/default.yaml`。
 
+Web 页面里的运行任务、回填、保存配置、测试连接和重载 corpus 等修改性操作需要输入操作密码。默认密码在 `server.admin_password` 中配置，也可以通过环境变量 `ARXIV_DAILY_ADMIN_PASSWORD` 覆盖。
+
 ## 项目结构
 
 ```text

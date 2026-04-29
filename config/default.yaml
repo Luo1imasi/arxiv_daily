@@ -20,7 +20,7 @@ source:
     min_keyword_matches: 1
     recent_days: 14
     max_recent_days: 140
-    recent_max_results: 200
+    recent_max_results: 2000
     recency_half_life_days: 14
     lookback_score_threshold: 7.0
 
@@ -32,6 +32,7 @@ llm:
   timeout: 60.0
   max_retries: 3
   base_delay: 1.0
+  max_concurrent_requests: 2
 
 reranker:
   model: "jinaai/jina-embeddings-v5-text-nano"
@@ -56,9 +57,11 @@ executor:
   schedule_minute: 0
   manifest_ttl_minutes: 30
   retriever_workers: 4
+  corpus_workers: 8
   llm_workers: 4
-  arxiv_fetch_workers: 4
+  arxiv_id_batch_size: 50
 
 server:
   host: "0.0.0.0"
   port: 5555
+  admin_password: "admin"
