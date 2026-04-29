@@ -1,9 +1,12 @@
 import os
 import sys
 import json
-from datetime import datetime, timezone
+import hmac
+from datetime import date, datetime, timezone
 from pathlib import Path
 from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator
+from typing import Any
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Request, HTTPException
@@ -25,17 +28,25 @@ from .config import (
 )
 from .executor import Executor
 from .task_runner import TaskRunner
+from .business_date import get_business_date, get_business_timezone_info
 
 BASE_DIR = Path(__file__).parent
-SENSITIVE_KEYS = {"password", "api_key", "key"}
+SENSITIVE_KEYS = {"password", "api_key", "key", "admin_password"}
+ADMIN_PASSWORD_ENV = "ARXIV_DAILY_ADMIN_PASSWORD"
 _jinja_env = jinja2.Environment(
     loader=jinja2.FileSystemLoader(str(BASE_DIR / "templates")),
     autoescape=jinja2.select_autoescape(["html"]),
 )
-_jinja_env.filters["from_json"] = lambda v: json.loads(v) if isinstance(v, str) else v
+
+
+def _from_json_filter(value: Any) -> Any:
+    return json.loads(value) if isinstance(value, str) else value
+
+
+_jinja_env.filters["from_json"] = _from_json_filter
 
 _scheduler: AsyncIOScheduler | None = None
-_app_config: dict = {}
+_app_config: dict[str, Any] = {}
 _task_runner = TaskRunner()
 
 
@@ -48,8 +59,8 @@ def _configure_logging():
     )
 
 
-def _mask_password(d: dict) -> dict:
-    result = {}
+def _mask_password(d: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
     for k, v in d.items():
         if isinstance(v, dict):
             result[k] = _mask_password(v)
@@ -60,19 +71,14 @@ def _mask_password(d: dict) -> dict:
     return result
 
 
-def _get_schedule_settings(config: dict) -> tuple[str, ZoneInfo, int, int]:
-    tz_name, tz = _get_business_timezone(config)
+def _get_schedule_settings(config: dict[str, Any]) -> tuple[str, ZoneInfo, int, int]:
+    tz_name, tz = get_business_timezone_info(config)
     return (
         tz_name,
         tz,
         int(get_config_value(config, "executor.schedule_hour")),
         int(get_config_value(config, "executor.schedule_minute")),
     )
-
-
-def _get_business_timezone(config: dict) -> tuple[str, ZoneInfo]:
-    tz_name = get_config_value(config, "executor.timezone")
-    return tz_name, ZoneInfo(tz_name)
 
 
 def _format_run_timestamp(value: str | None, tz: ZoneInfo) -> str | None:
@@ -87,7 +93,21 @@ def _format_run_timestamp(value: str | None, tz: ZoneInfo) -> str | None:
     return dt.astimezone(tz).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _decorate_timestamp_fields(record: dict, tz: ZoneInfo) -> dict:
+def _get_admin_password() -> str:
+    env_password = os.environ.get(ADMIN_PASSWORD_ENV)
+    if env_password is not None:
+        return env_password
+    return str(get_config_value(_app_config, "server.admin_password", "admin"))
+
+
+async def _require_admin_password(request: Request) -> None:
+    expected = _get_admin_password()
+    provided = request.headers.get("X-Admin-Password", "")
+    if not expected or not hmac.compare_digest(provided, expected):
+        raise HTTPException(status_code=401, detail="Invalid operation password")
+
+
+def _decorate_timestamp_fields(record: dict[str, Any], tz: ZoneInfo) -> dict[str, Any]:
     for field in ("started_at", "finished_at", "created_at", "updated_at"):
         if field in record:
             raw_value = record.get(field)
@@ -97,16 +117,18 @@ def _decorate_timestamp_fields(record: dict, tz: ZoneInfo) -> dict:
     return record
 
 
-def _decorate_latest_run_for_display(latest_run: dict | None, config: dict) -> dict | None:
+def _decorate_latest_run_for_display(
+    latest_run: dict[str, Any] | None, config: dict[str, Any]
+) -> dict[str, Any] | None:
     if not latest_run:
         return latest_run
-    tz_name, tz = _get_business_timezone(config)
+    tz_name, tz = get_business_timezone_info(config)
     decorated = _decorate_timestamp_fields(dict(latest_run), tz)
     decorated["display_timezone"] = tz_name
     return decorated
 
 
-async def _build_page_context(current_date: str | None) -> dict:
+async def _build_page_context(current_date: str | None) -> dict[str, Any]:
     dates = await db.get_all_dates()
     papers = await db.get_papers_by_date(current_date) if current_date else []
     corpus_count = await db.get_corpus_count()
@@ -134,7 +156,34 @@ async def _start_executor_run(skip_tldr: bool = False, trigger: str = "manual") 
     )
 
 
-def _reschedule_daily_run(config: dict) -> None:
+async def _start_backfill_run(
+    start_date: str, end_date: str, skip_tldr: bool = False, trigger: str = "manual"
+) -> int:
+    executor = Executor(_app_config)
+    return await _task_runner.start(
+        "recommendation backfill",
+        lambda: executor.run_between_dates(start_date, end_date, skip_tldr=skip_tldr),
+        trigger=trigger,
+        metadata={"skip_tldr": skip_tldr, "start_date": start_date, "end_date": end_date},
+        result_to_metrics=lambda _result: dict(executor.last_run_metrics),
+    )
+
+
+def _parse_backfill_date(value: object, field_name: str) -> date:
+    raw_value = str(value or "").strip()
+    if not raw_value:
+        raise HTTPException(status_code=400, detail=f"{field_name} is required")
+    try:
+        return date.fromisoformat(raw_value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"{field_name} must be YYYY-MM-DD") from exc
+
+
+def _current_business_date(config: dict[str, Any]) -> date:
+    return get_business_date(config)
+
+
+def _reschedule_daily_run(config: dict[str, Any]) -> None:
     if not _scheduler:
         return
 
@@ -146,7 +195,7 @@ def _reschedule_daily_run(config: dict) -> None:
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     global _scheduler, _app_config
     _configure_logging()
 
@@ -184,7 +233,7 @@ app = FastAPI(title="arXiv Daily", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
 
-def _render(template_name: str, context: dict) -> HTMLResponse:
+def _render(template_name: str, context: dict[str, Any]) -> HTMLResponse:
     tmpl = _jinja_env.get_template(template_name)
     return HTMLResponse(tmpl.render(**context))
 
@@ -202,12 +251,39 @@ async def papers_by_date(date: str):
 
 
 @app.post("/api/run")
-async def trigger_run():
+async def trigger_run(request: Request):
+    await _require_admin_password(request)
     if _task_runner.is_running():
         raise HTTPException(status_code=409, detail="A task is already running")
 
     await _start_executor_run(skip_tldr=False, trigger="manual")
     return JSONResponse({"status": "started", "message": "Task started"})
+
+
+@app.post("/api/run-until")
+async def trigger_run_until(request: Request):
+    await _require_admin_password(request)
+    if _task_runner.is_running():
+        raise HTTPException(status_code=409, detail="A task is already running")
+
+    body = await request.json()
+    start_date = _parse_backfill_date(body.get("start_date"), "start_date")
+    end_date = _parse_backfill_date(body.get("end_date"), "end_date")
+    today = _current_business_date(_app_config)
+    if start_date > today or end_date > today:
+        raise HTTPException(status_code=400, detail="backfill dates cannot be later than today")
+    if start_date > end_date:
+        raise HTTPException(
+            status_code=400,
+            detail="start_date must be the older date and cannot be later than end_date",
+        )
+
+    await _start_backfill_run(
+        start_date.isoformat(),
+        end_date.isoformat(),
+        skip_tldr=bool(body.get("skip_tldr", False)),
+    )
+    return JSONResponse({"status": "started", "message": "Backfill task started"})
 
 
 @app.get("/api/status")
@@ -225,6 +301,7 @@ async def get_config():
 @app.post("/api/config")
 async def update_config(request: Request):
     global _app_config
+    await _require_admin_password(request)
     body = await request.json()
 
     merged = deep_merge(_app_config, body)
@@ -252,6 +329,7 @@ async def update_config(request: Request):
 
 @app.post("/api/webdav/test")
 async def test_webdav(request: Request):
+    await _require_admin_password(request)
     body = await request.json()
     local_path = body.get("local_path", "")
     if local_path:
@@ -272,6 +350,7 @@ async def test_webdav(request: Request):
 
 @app.post("/api/llm/test")
 async def test_llm(request: Request):
+    await _require_admin_password(request)
     body = await request.json()
     from .llm import test_connection
 
@@ -281,7 +360,8 @@ async def test_llm(request: Request):
 
 
 @app.post("/api/corpus/reload")
-async def reload_corpus():
+async def reload_corpus(request: Request):
+    await _require_admin_password(request)
     if _task_runner.is_running():
         raise HTTPException(status_code=409, detail="A task is already running")
 
