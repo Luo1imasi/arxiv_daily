@@ -1,9 +1,8 @@
 from abc import ABC, abstractmethod
 from typing import Any, Type
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from loguru import logger
-from tqdm import tqdm
 from ..protocol import Paper, CorpusPaper
+from ..utils import parallel_execute
 
 
 class BaseRetriever(ABC):
@@ -34,21 +33,24 @@ class BaseRetriever(ABC):
         max_workers = 4
         if isinstance(executor_config, dict):
             max_workers = int(executor_config.get("retriever_workers", 4) or 4)
-        papers = []
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(self.convert_to_paper, p): p for p in raw_papers}
-            for future in tqdm(
-                as_completed(futures), total=len(futures), desc="Converting papers"
-            ):
-                try:
-                    paper = future.result()
-                    if paper is not None:
-                        papers.append(paper)
-                except Exception as exc:
-                    logger.warning(f"Skipping paper: {exc}")
+        def convert(raw_paper: Any) -> Paper | None:
+            try:
+                return self.convert_to_paper(raw_paper)
+            except Exception as exc:
+                logger.warning(f"Skipping paper: {exc}")
+                return None
 
-        return papers
+        return [
+            paper
+            for paper in parallel_execute(
+                convert,
+                raw_papers,
+                max_workers=max_workers,
+                desc="Converting papers",
+            )
+            if paper is not None
+        ]
 
 
 _registered_retrievers: dict[str, Type[BaseRetriever]] = {}

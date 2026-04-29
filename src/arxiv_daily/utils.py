@@ -5,14 +5,13 @@ import re
 import time
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import ParamSpec, TypeVar
+from typing import Any, TypeVar
 
 from loguru import logger
 from tqdm import tqdm
 
 T = TypeVar("T")
 R = TypeVar("R")
-P = ParamSpec("P")
 
 
 def parallel_execute(
@@ -20,6 +19,8 @@ def parallel_execute(
     items: Iterable[T],
     max_workers: int = 8,
     desc: str = "Processing",
+    *,
+    raise_on_error: bool = False,
 ) -> list[R]:
     """并发执行函数并收集结果
 
@@ -36,15 +37,23 @@ def parallel_execute(
     if not items_list:
         return []
 
-    results = []
+    results: list[R | None] = [None] * len(items_list)
+    errors: list[Exception] = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(func, item): item for item in items_list}
+        futures = {
+            executor.submit(func, item): index
+            for index, item in enumerate(items_list)
+        }
         for future in tqdm(as_completed(futures), total=len(futures), desc=desc):
+            index = futures[future]
             try:
-                results.append(future.result())
+                results[index] = future.result()
             except Exception as e:
+                errors.append(e)
                 logger.warning(f"parallel_execute task failed: {e}")
-    return results
+    if errors and raise_on_error:
+        raise RuntimeError(f"{len(errors)} parallel task(s) failed") from errors[0]
+    return [result for result in results if result is not None]
 
 
 def normalize_text(value: str) -> str:
@@ -57,9 +66,9 @@ def make_content_key(title: str, abstract: str) -> str:
 
 
 def retry_call(
-    func: Callable[P, R],
+    func: Callable[..., R],
     args: tuple[object, ...] = (),
-    kwargs: dict[str, object] | None = None,
+    kwargs: dict[str, Any] | None = None,
     max_retries: int = 3,
     base_delay: float = 1.0,
     max_delay: float = 30.0,
