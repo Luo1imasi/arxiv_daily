@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import re
 import uuid
@@ -5,8 +7,9 @@ import json
 import shutil
 import hashlib
 import zipfile
+import threading
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from loguru import logger
 from datetime import datetime
 
@@ -32,7 +35,10 @@ except ImportError:
 
 CACHE_DIR = Path.home() / ".arxiv_daily" / "papers"
 _META_DIR = Path.home() / ".arxiv_daily" / "meta"
-_webdav_client_cache: dict = {}
+FileInfo = dict[str, Any]
+Manifest = dict[str, Any]
+_webdav_client_cache: dict[tuple[str, str, str, str], WebDAVClient] = {}
+_webdav_client_cache_lock = threading.Lock()
 
 
 def _get_cached_webdav_client(
@@ -40,9 +46,10 @@ def _get_cached_webdav_client(
 ) -> "WebDAVClient":
     """获取缓存的WebDAV客户端"""
     key = (url, username, password, base_path)
-    if key not in _webdav_client_cache:
-        _webdav_client_cache[key] = WebDAVClient(url, username, password, base_path)
-    return _webdav_client_cache[key]
+    with _webdav_client_cache_lock:
+        if key not in _webdav_client_cache:
+            _webdav_client_cache[key] = WebDAVClient(url, username, password, base_path)
+        return _webdav_client_cache[key]
 
 
 def _get_cache_path(source_path: str, name: str) -> Path:
@@ -60,7 +67,7 @@ def _meta_cache_path(pdf_path: str) -> Path:
     return _META_DIR / f"{h}.json"
 
 
-def _manifest_cache_path(webdav_config: dict) -> Path:
+def _manifest_cache_path(webdav_config: dict[str, Any]) -> Path:
     local_path = webdav_config.get("local_path", "")
     source_key = local_path or "|".join(
         [
@@ -73,24 +80,25 @@ def _manifest_cache_path(webdav_config: dict) -> Path:
     return _META_DIR / f"manifest_{source_hash}.json"
 
 
-def load_corpus_manifest(webdav_config: dict) -> Optional[dict]:
+def load_corpus_manifest(webdav_config: dict[str, Any]) -> Manifest | None:
     path = _manifest_cache_path(webdav_config)
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
     except Exception:
         return None
 
 
-def save_corpus_manifest(webdav_config: dict, manifest: dict):
+def save_corpus_manifest(webdav_config: dict[str, Any], manifest: Manifest):
     _ensure_cache_dir()
     path = _manifest_cache_path(webdav_config)
     path.write_text(json.dumps(manifest, ensure_ascii=False, sort_keys=True), encoding="utf-8")
 
 
-def _build_manifest_from_files(files: list[dict]) -> dict:
-    entries = []
+def _build_manifest_from_files(files: list[FileInfo]) -> Manifest:
+    entries: list[FileInfo] = []
     for file_info in files:
         modified = file_info.get("modified")
         if isinstance(modified, datetime):
@@ -111,7 +119,13 @@ def _build_manifest_from_files(files: list[dict]) -> dict:
     }
 
 
-def _manifest_entry_key(entry: dict) -> tuple[str, int, str]:
+def manifest_content_equal(left: Manifest | None, right: Manifest | None) -> bool:
+    if not left or not right:
+        return False
+    return left.get("count") == right.get("count") and left.get("files", []) == right.get("files", [])
+
+
+def _manifest_entry_key(entry: FileInfo) -> tuple[str, int, str]:
     return (
         entry.get("path", ""),
         int(entry.get("size", 0) or 0),
@@ -119,11 +133,11 @@ def _manifest_entry_key(entry: dict) -> tuple[str, int, str]:
     )
 
 
-def build_corpus_manifest(webdav_config: dict) -> dict:
+def build_corpus_manifest(webdav_config: dict[str, Any]) -> Manifest:
     local_source_path = webdav_config.get("local_path", "")
     use_local = local_source_path and os.path.isdir(local_source_path)
 
-    files = []
+    files: list[FileInfo] = []
     if use_local:
         _walk_local(local_source_path, files, [])
     else:
@@ -138,17 +152,18 @@ def build_corpus_manifest(webdav_config: dict) -> dict:
     return _build_manifest_from_files(files)
 
 
-def _load_meta_cache(pdf_path: str) -> Optional[dict]:
+def _load_meta_cache(pdf_path: str) -> dict[str, Any] | None:
     p = _meta_cache_path(pdf_path)
     if p.exists():
         try:
-            return json.loads(p.read_text(encoding="utf-8"))
+            data = json.loads(p.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else None
         except Exception:
             return None
     return None
 
 
-def _save_meta_cache(pdf_path: str, data: dict):
+def _save_meta_cache(pdf_path: str, data: dict[str, Any]):
     p = _meta_cache_path(pdf_path)
     try:
         p.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
@@ -182,6 +197,7 @@ class WebDAVClient:
         self.password = password
         self.base_path = base_path if base_path.endswith("/") else base_path + "/"
         self._client = None
+        self._client_lock = threading.Lock()
 
     def _get_client(self):
         if self._client is None:
@@ -202,13 +218,13 @@ class WebDAVClient:
             logger.error(f"WebDAV connection test failed: {e}")
             return False
 
-    def list_files(self) -> list[dict]:
+    def list_files(self) -> list[FileInfo]:
         client = self._get_client()
-        files = []
+        files: list[FileInfo] = []
         self._walk(client, self.base_path, files, [])
         return files
 
-    def _walk(self, client, path: str, files: list, current_path_parts: list[str]):
+    def _walk(self, client: Any, path: str, files: list[FileInfo], current_path_parts: list[str]):
         try:
             items = client.ls(path)
         except Exception as e:
@@ -239,8 +255,9 @@ class WebDAVClient:
                     )
 
     def download_file(self, remote_path: str, local_path: str):
-        client = self._get_client()
-        client.download_file(remote_path, local_path)
+        with self._client_lock:
+            client = self._get_client()
+            client.download_file(remote_path, Path(local_path))
 
 
 def extract_text_from_pdf(file_path: str) -> Optional[str]:
@@ -251,13 +268,13 @@ def extract_text_from_pdf(file_path: str) -> Optional[str]:
         text = pymupdf4llm.to_markdown(
             file_path, use_ocr=False, header=False, footer=False, ignore_code=True
         )
-        return text
+        return text if isinstance(text, str) else None
     except Exception as e:
         logger.warning(f"Failed to extract text from {file_path}: {e}")
         return None
 
 
-def extract_metadata_from_pdf(file_path: str) -> dict:
+def extract_metadata_from_pdf(file_path: str) -> dict[str, str]:
     if pymupdf is None:
         return {}
     try:
@@ -335,7 +352,7 @@ def _select_best_abstract(title: str, metadata_subject: str, text: Optional[str]
     return title
 
 
-def _walk_local(path: str, files: list, current_path_parts: list[str]):
+def _walk_local(path: str, files: list[FileInfo], current_path_parts: list[str]):
     try:
         items = os.listdir(path)
     except Exception as e:
@@ -365,7 +382,7 @@ def _walk_local(path: str, files: list, current_path_parts: list[str]):
 
 
 def _process_file(
-    file_info: dict, cache_dir: Path, webdav_client=None
+    file_info: FileInfo, cache_dir: Path, webdav_client: WebDAVClient | None = None
 ) -> Optional[tuple[str, datetime]]:
     _ensure_cache_dir()
     name = file_info["name"]
@@ -410,7 +427,7 @@ def _process_file(
     return None
 
 
-def _process_single(args) -> Optional[CorpusPaper]:
+def _process_single(args: tuple[FileInfo, Path, WebDAVClient | None]) -> Optional[CorpusPaper]:
     file_info, cache_dir, webdav_client = args
     result = _process_file(file_info, cache_dir, webdav_client)
     if not result:
@@ -435,7 +452,7 @@ def _process_single(args) -> Optional[CorpusPaper]:
 
     if isinstance(modified, str):
         try:
-            modified = datetime.fromisoformat(modified.replace("Z", "+00:00"))
+            modified = datetime.fromisoformat(str(modified).replace("Z", "+00:00"))
         except (ValueError, AttributeError):
             modified = datetime.now()
 
@@ -452,17 +469,17 @@ def _process_single(args) -> Optional[CorpusPaper]:
 
 
 def fetch_corpus(
-    webdav_config: dict,
-    executor_config: dict = None,
+    webdav_config: dict[str, Any],
+    executor_config: dict[str, Any] | None = None,
     previous_corpus: Optional[list[CorpusPaper]] = None,
-    previous_manifest: Optional[dict] = None,
+    previous_manifest: Manifest | None = None,
 ) -> list[CorpusPaper]:
     _ensure_cache_dir()
 
     local_source_path = webdav_config.get("local_path", "")
     use_local = local_source_path and os.path.isdir(local_source_path)
 
-    files = []
+    files: list[FileInfo] = []
     webdav_client = None
 
     if use_local:
