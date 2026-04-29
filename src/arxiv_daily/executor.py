@@ -1,11 +1,13 @@
 import os
 import asyncio
 import concurrent.futures
-from datetime import datetime
-from zoneinfo import ZoneInfo
+from datetime import date, datetime
 from loguru import logger
 
-from .protocol import Paper
+from collections.abc import Sequence
+from typing import Any
+
+from .protocol import CorpusPaper, Paper
 from .webdav import fetch_corpus
 from .retriever import get_retriever_cls
 from .reranker import get_reranker_cls
@@ -13,6 +15,13 @@ from .llm import generate_tldr
 from . import database as db
 from .config import get_config_value
 from .utils import make_content_key
+from .business_date import (
+    business_date_range_between as _business_date_range_between,
+    business_date_range_until as _business_date_range_until,
+    config_for_business_date as _config_for_business_date,
+    get_business_date_string as _get_business_date,
+    normalize_business_date as _normalize_business_date,
+)
 
 _executor_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
@@ -22,16 +31,7 @@ def _fallback_tldr(p: Paper):
     p.tldr = None
 
 
-def _get_business_timezone(config: dict) -> ZoneInfo:
-    tz_name = get_config_value(config, "executor.timezone")
-    return ZoneInfo(tz_name)
-
-
-def _get_business_date(config: dict) -> str:
-    return datetime.now(_get_business_timezone(config)).strftime("%Y-%m-%d")
-
-
-def _get_llm_cache_key(config: dict) -> str:
+def _get_llm_cache_key(config: dict[str, Any]) -> str:
     return "|".join(
         [
             get_config_value(config, "llm.base_url"),
@@ -54,7 +54,7 @@ def _default_llm_metrics(*, enabled: bool, target_count: int = 0) -> dict[str, o
 
 
 async def _apply_tldr_enrichment(
-    papers: list[Paper], config: dict, metrics: dict[str, object]
+    papers: list[Paper], config: dict[str, Any], metrics: dict[str, object]
 ) -> None:
     llm_config = config.get("llm", {})
     metrics.update(
@@ -120,6 +120,8 @@ async def _apply_tldr_enrichment(
             "url": paper.url,
             "pdf_url": paper.pdf_url,
             "content_key": content_key,
+            "tldr": None,
+            "llm_cache_key": None,
         }
         if paper.url not in failed_urls and paper.tldr:
             entry.update(
@@ -146,10 +148,10 @@ async def _apply_tldr_enrichment(
 
 
 async def _filter_seen_papers(
-    papers: list[Paper], corpus: list[Paper] | list, business_date: str
+    papers: list[Paper], corpus: Sequence[object], business_date: str
 ) -> list[Paper]:
-    seen_urls = await db.get_seen_paper_urls(exclude_date=business_date)
-    seen_content_keys = await db.get_seen_paper_content_keys(exclude_date=business_date)
+    seen_urls = await db.get_seen_paper_urls(before_date=business_date)
+    seen_content_keys = await db.get_seen_paper_content_keys(before_date=business_date)
     corpus_content_keys = {
         make_content_key(getattr(paper, "title", ""), getattr(paper, "abstract", "") or "")
         for paper in corpus
@@ -177,17 +179,89 @@ async def _filter_seen_papers(
 
 
 class Executor:
-    def __init__(self, config: dict):
+    def __init__(self, config: dict[str, Any]):
         self.config = config
         self.last_run_metrics: dict[str, object] = {
             "status": "initialized",
             "sources": [],
         }
 
-    async def fetch_corpus(self, force_refresh: bool = False) -> list:
-        logger.info("Fetching corpus...")
-        from .webdav import build_corpus_manifest, load_corpus_manifest
+    async def run_for_date(self, business_date: str | date, skip_tldr: bool = False) -> list[Paper]:
+        scoped = Executor(_config_for_business_date(self.config, _normalize_business_date(business_date)))
+        result = await scoped.run(skip_tldr=skip_tldr)
+        self.last_run_metrics = dict(scoped.last_run_metrics)
+        return result
 
+    async def run_until_date(self, until_date: str | date, skip_tldr: bool = False) -> dict[str, object]:
+        dates = _business_date_range_until(self.config, until_date)
+        return await self._run_backfill_dates(
+            dates,
+            start_date=dates[-1],
+            end_date=dates[0],
+            skip_tldr=skip_tldr,
+        )
+
+    async def run_between_dates(
+        self, start_date: str | date, end_date: str | date, skip_tldr: bool = False
+    ) -> dict[str, object]:
+        dates = _business_date_range_between(self.config, start_date, end_date)
+        return await self._run_backfill_dates(
+            dates,
+            start_date=dates[0],
+            end_date=dates[-1],
+            skip_tldr=skip_tldr,
+        )
+
+    async def _run_backfill_dates(
+        self,
+        dates: list[str],
+        *,
+        start_date: str,
+        end_date: str,
+        skip_tldr: bool = False,
+    ) -> dict[str, object]:
+        summary: list[dict[str, object]] = []
+        total_recommendations = 0
+        self.last_run_metrics = {
+            "status": "running",
+            "mode": "backfill",
+            "start_date": start_date,
+            "end_date": end_date,
+            "until_date": end_date,
+            "date_count": len(dates),
+            "dates": [],
+        }
+
+        for business_date in dates:
+            logger.info(f"Backfill generating recommendations for {business_date}")
+            papers = await self.run_for_date(business_date, skip_tldr=skip_tldr)
+            day_metrics = dict(self.last_run_metrics)
+            day_summary = {
+                "date": business_date,
+                "status": day_metrics.get("status"),
+                "recommendations": len(papers),
+            }
+            summary.append(day_summary)
+            total_recommendations += len(papers)
+
+        self.last_run_metrics = {
+            "status": "completed",
+            "mode": "backfill",
+            "start_date": start_date,
+            "end_date": end_date,
+            "until_date": end_date,
+            "date_count": len(dates),
+            "final_recommendations": total_recommendations,
+            "dates": summary,
+        }
+        return self.last_run_metrics
+
+    async def fetch_corpus(self, force_refresh: bool = False) -> list[CorpusPaper]:
+        logger.info("Fetching corpus...")
+        from .webdav import build_corpus_manifest, load_corpus_manifest, manifest_content_equal
+
+        cached = None
+        cached_manifest = None
         if not force_refresh:
             cached = await db.load_corpus_cache()
             if cached and len(cached) > 0:
@@ -221,7 +295,7 @@ class Executor:
                         )
                     else:
                         current_manifest = build_corpus_manifest(self.config["webdav"])
-                        if current_manifest != cached_manifest:
+                        if not manifest_content_equal(current_manifest, cached_manifest):
                             valid = False
                             logger.info("Corpus source changed, refreshing corpus cache...")
                 if valid:
@@ -231,8 +305,8 @@ class Executor:
                     logger.info("Cache files missing, refreshing corpus...")
 
         loop = asyncio.get_event_loop()
-        previous_corpus = cached if 'cached' in locals() and cached else None
-        previous_manifest = cached_manifest if 'cached_manifest' in locals() else None
+        previous_corpus = cached if cached else None
+        previous_manifest = cached_manifest
         return await loop.run_in_executor(
             _executor_pool,
             lambda: fetch_corpus(
@@ -269,6 +343,7 @@ class Executor:
 
         sources = self.config.get("executor", {}).get("source", ["arxiv"])
         loop = asyncio.get_event_loop()
+        source_metrics: list[dict[str, object]] = []
 
         async def _retrieve_source(source: str) -> tuple[str, list[Paper]]:
             logger.info(f"Retrieving {source} papers...")
@@ -284,10 +359,9 @@ class Executor:
         all_papers = []
         for source, papers in source_results:
             logger.info(f"Retrieved {len(papers)} {source} papers")
-            self.last_run_metrics["sources"].append(
-                {"name": source, "retrieved": len(papers)}
-            )
+            source_metrics.append({"name": source, "retrieved": len(papers)})
             all_papers.extend(papers)
+        self.last_run_metrics["sources"] = source_metrics
 
         if not all_papers:
             logger.info("No new papers found today")
