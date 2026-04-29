@@ -2,9 +2,11 @@ import asyncio
 import hashlib
 import math
 import re
+import threading
+import time as time_module
 from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, cast, override
 
 import feedparser
@@ -16,13 +18,18 @@ from tqdm import tqdm
 from .base import BaseRetriever, register_retriever
 from ..protocol import Paper, CorpusPaper
 from ..config import get_config_value
-from ..utils import make_content_key, parallel_execute
+from ..utils import make_content_key
 from ..llm import extract_keywords_from_paper
 from .. import database as db
+from ..business_date import business_window_utc as _business_window_utc
+from ..business_date import get_business_date as _business_date
 
 RawPaper = dict[str, object]
 _ARXIV = cast(Any, arxiv)
 _FEEDPARSER = cast(Any, feedparser)
+_ARXIV_REQUEST_LOCK = threading.Lock()
+_last_arxiv_request_at = 0.0
+_ARXIV_MIN_REQUEST_INTERVAL_SECONDS = 3.0
 
 TOKEN_PATTERN = re.compile(r"[a-z][a-z0-9+\-\.]{1,}")
 STOPWORDS = {
@@ -85,6 +92,49 @@ def _paper_published(paper: RawPaper):
         return None
 
 
+def _published_in_window(
+    published: datetime | None,
+    window_start: datetime,
+    window_end: datetime,
+) -> bool:
+    if published is None:
+        return False
+    published_utc = (
+        published.replace(tzinfo=timezone.utc)
+        if published.tzinfo is None
+        else published.astimezone(timezone.utc)
+    )
+    return window_start <= published_utc < window_end
+
+
+def _arxiv_date(value: datetime) -> str:
+    return value.astimezone(timezone.utc).strftime("%Y%m%d%H%M")
+
+
+def _wait_for_arxiv_request_slot() -> None:
+    global _last_arxiv_request_at
+    with _ARXIV_REQUEST_LOCK:
+        now = time_module.monotonic()
+        elapsed = now - _last_arxiv_request_at
+        if elapsed < _ARXIV_MIN_REQUEST_INTERVAL_SECONDS:
+            time_module.sleep(_ARXIV_MIN_REQUEST_INTERVAL_SECONDS - elapsed)
+        _last_arxiv_request_at = time_module.monotonic()
+
+
+def _looks_like_oversized_arxiv_request(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "414",
+            "uri too long",
+            "url too long",
+            "request-uri too long",
+            "request uri too long",
+        )
+    )
+
+
 def _raw_paper_text(value: object | None) -> str | None:
     return value if isinstance(value, str) else None
 
@@ -128,6 +178,11 @@ def _to_raw_paper(paper: ArxivResult | RawPaper) -> RawPaper:
             break
 
     published = getattr(paper, "published", None)
+    primary_category = getattr(getattr(paper, "primary_category", None), "term", None)
+    categories = [
+        str(getattr(category, "term", category))
+        for category in getattr(paper, "categories", [])
+    ]
     return {
         "title": paper.title,
         "authors": [a.name for a in paper.authors],
@@ -136,9 +191,38 @@ def _to_raw_paper(paper: ArxivResult | RawPaper) -> RawPaper:
         "pdf_url": paper.pdf_url,
         "code_url": code_url,
         "published": published.isoformat() if published else None,
+        "primary_category": primary_category,
+        "categories": categories,
         "retrieval_score": float(getattr(paper, "retrieval_score", 0.0) or 0.0),
         "lookback_score": float(getattr(paper, "lookback_score", 0.0) or 0.0),
     }
+
+
+def _raw_paper_primary_category(paper: RawPaper) -> str | None:
+    value = paper.get("primary_category")
+    return value if isinstance(value, str) and value else None
+
+
+def _raw_paper_categories(paper: RawPaper) -> list[str]:
+    values = paper.get("categories", [])
+    if not isinstance(values, list):
+        return []
+    return [str(value) for value in values if value]
+
+
+def _matches_category_policy(
+    paper: RawPaper, categories: list[str], *, include_cross: bool
+) -> bool:
+    category_set = set(categories)
+    if include_cross:
+        paper_categories = set(_raw_paper_categories(paper))
+        primary_category = _raw_paper_primary_category(paper)
+        if primary_category:
+            paper_categories.add(primary_category)
+        return not paper_categories or bool(paper_categories & category_set)
+
+    primary_category = _raw_paper_primary_category(paper)
+    return primary_category is None or primary_category in category_set
 
 
 def _paper_with_scores(
@@ -328,6 +412,7 @@ class ArxivRetriever(BaseRetriever):
         )
         max_paper_num = max(1, int(get_config_value(config, "executor.max_paper_num")))
         self.lookback_top_n = max(1, min(8, max(3, max_paper_num // 4)))
+        self.lookback_min_strong_papers = max(1, min(3, self.lookback_top_n // 2))
         self.lookback_score_threshold = float(
             get_config_value(config, "source.arxiv.lookback_score_threshold")
         )
@@ -335,6 +420,12 @@ class ArxivRetriever(BaseRetriever):
             1.0,
             float(get_config_value(config, "source.arxiv.recency_half_life_days")),
         )
+        self.business_date = _business_date(config)
+        if "arxiv_fetch_workers" in self.executor_config:
+            logger.warning(
+                "executor.arxiv_fetch_workers is deprecated and ignored; "
+                "use executor.arxiv_id_batch_size to tune arXiv ID lookup batches"
+            )
 
     def _candidate_cache_key(
         self,
@@ -347,6 +438,8 @@ class ArxivRetriever(BaseRetriever):
         payload = {
             "categories": list(categories),
             "include_cross_list": bool(get_config_value(self.config, "source.arxiv.include_cross_list")),
+            "business_date": self.business_date.isoformat(),
+            "timezone": str(get_config_value(self.config, "executor.timezone")),
             "start_days_ago": int(start_days_ago),
             "recent_days": lookback_end,
             "recent_max_results": int(get_config_value(self.config, "source.arxiv.recent_max_results")),
@@ -430,10 +523,18 @@ class ArxivRetriever(BaseRetriever):
             return True
 
         top_n = min(len(ranked_papers), self.lookback_top_n)
-        avg_top_score = sum(_paper_lookback_score(paper) for paper in ranked_papers[:top_n]) / top_n
+        top_scores = [_paper_lookback_score(paper) for paper in ranked_papers[:top_n]]
+        avg_top_score = sum(top_scores) / top_n
+        strong_paper_count = sum(score >= self.lookback_score_threshold for score in top_scores)
+        required_strong_papers = min(self.lookback_min_strong_papers, top_n)
         if avg_top_score < self.lookback_score_threshold:
             logger.info(
                 f"Average lookback score of top {top_n} candidates is {avg_top_score:.2f}, below threshold {self.lookback_score_threshold:.2f}"
+            )
+            return True
+        if strong_paper_count < required_strong_papers:
+            logger.info(
+                f"Only {strong_paper_count} of top {top_n} candidates exceed lookback threshold {self.lookback_score_threshold:.2f}; need {required_strong_papers}"
             )
             return True
         return False
@@ -578,34 +679,47 @@ class ArxivRetriever(BaseRetriever):
             end_days_ago=end_days_ago,
         )
         cached_pool = asyncio.run(db.load_candidate_cache(cache_key))
-        if cached_pool:
+        if cached_pool is not None:
             logger.info(f"Using cached candidate pool: {len(cached_pool)} papers")
             return [dict(paper) for paper in cached_pool]
 
-        def _fetch_rss_candidates(_: str) -> tuple[str, list[ArxivResult]]:
-            rss_paper_ids = self._fetch_rss_paper_ids(categories)
-            return "rss", self._fetch_papers_by_ids(rss_paper_ids) if rss_paper_ids else []
+        window_start, window_end = _business_window_utc(
+            self.config,
+            start_days_ago=start_days_ago,
+            end_days_ago=end_days_ago or self.initial_recent_days,
+        )
 
-        def _fetch_recent_candidates(_: str) -> tuple[str, list[ArxivResult]]:
-            return "recent", self._fetch_recent_category_papers(
+        def _fetch_rss_candidates(_: str) -> tuple[str, list[ArxivResult | RawPaper]]:
+            _wait_for_arxiv_request_slot()
+            rss_paper_ids = self._fetch_rss_paper_ids(categories)
+            rss_papers = self._fetch_papers_by_ids(rss_paper_ids) if rss_paper_ids else []
+            return "rss", [
+                paper
+                for paper in rss_papers
+                if _published_in_window(
+                    _paper_published(_to_raw_paper(paper)),
+                    window_start,
+                    window_end,
+                )
+            ]
+
+        def _fetch_recent_candidates(_: str) -> tuple[str, list[ArxivResult | RawPaper]]:
+            recent_papers: list[ArxivResult | RawPaper] = list(self._fetch_recent_category_papers(
                 categories,
                 start_days_ago=start_days_ago,
                 end_days_ago=end_days_ago,
-            )
+            ))
+            return "recent", recent_papers
 
         source_labels = ["recent"]
         if start_days_ago <= 0:
             source_labels.insert(0, "rss")
 
-        candidate_sources = parallel_execute(
-            lambda source: _fetch_rss_candidates(source)
-            if source == "rss"
-            else _fetch_recent_candidates(source),
-            source_labels,
-            max_workers=len(source_labels),
-            desc="Collecting arXiv candidates",
-        )
-        source_results: dict[str, list[ArxivResult]] = {
+        candidate_sources = [
+            _fetch_rss_candidates(source) if source == "rss" else _fetch_recent_candidates(source)
+            for source in source_labels
+        ]
+        source_results: dict[str, list[ArxivResult | RawPaper]] = {
             label: papers for label, papers in candidate_sources
         }
         rss_papers = source_results.get("rss", [])
@@ -632,7 +746,7 @@ class ArxivRetriever(BaseRetriever):
         *,
         start_days_ago: int = 0,
         end_days_ago: int | None = None,
-    ) -> list[ArxivResult]:
+    ) -> list[RawPaper]:
         lookback_days = self.initial_recent_days if end_days_ago is None else int(end_days_ago)
         max_results = int(get_config_value(self.config, "source.arxiv.recent_max_results"))
         start_days_ago = max(0, int(start_days_ago))
@@ -640,28 +754,43 @@ class ArxivRetriever(BaseRetriever):
             return []
 
         query = " OR ".join(f"cat:{category}" for category in categories)
+        window_start, window_end = _business_window_utc(
+            self.config,
+            start_days_ago=start_days_ago,
+            end_days_ago=lookback_days,
+        )
+        query = f"({query}) AND submittedDate:[{_arxiv_date(window_start)} TO {_arxiv_date(window_end)}]"
         search = _ARXIV.Search(
             query=query,
             max_results=max_results,
             sort_by=_ARXIV.SortCriterion.SubmittedDate,
+            sort_order=_ARXIV.SortOrder.Descending,
         )
-        client = _ARXIV.Client(num_retries=5, delay_seconds=5)
-        now = datetime.now(timezone.utc)
-        earliest = now - timedelta(days=lookback_days)
-        latest = now - timedelta(days=start_days_ago)
-
-        papers: list[ArxivResult] = []
+        client = _ARXIV.Client(num_retries=5, delay_seconds=5, page_size=min(max_results, 2000))
+        papers: list[RawPaper] = []
+        include_cross = bool(get_config_value(self.config, "source.arxiv.include_cross_list"))
+        _wait_for_arxiv_request_slot()
         for result in client.results(search):
-            published = getattr(result, "published", None)
-            if published is None:
+            raw_paper = _to_raw_paper(result)
+            published = _paper_published(raw_paper)
+            if not _published_in_window(
+                published,
+                window_start,
+                window_end,
+            ):
+                if published is None:
+                    continue
+                published_utc = (
+                    published.replace(tzinfo=timezone.utc)
+                    if published.tzinfo is None
+                    else published.astimezone(timezone.utc)
+                )
+                if published_utc < window_start:
+                    break
                 continue
-            if published.tzinfo is None:
-                published = published.replace(tzinfo=timezone.utc)
-            if published > latest:
+            if not _matches_category_policy(raw_paper, categories, include_cross=include_cross):
                 continue
-            if published < earliest:
-                break
-            papers.append(result)
+            papers.append(raw_paper)
 
         if bool(self.executor_config.get("debug", False)):
             papers = papers[:20]
@@ -694,7 +823,7 @@ class ArxivRetriever(BaseRetriever):
                 else published.astimezone(timezone.utc)
             )
             age_days = max(
-                (datetime.now(timezone.utc) - published_utc).total_seconds() / 86400.0,
+                (_business_window_utc(self.config)[1] - published_utc).total_seconds() / 86400.0,
                 0.0,
             )
             return float(math.exp(-age_days / self.recency_half_life_days))
@@ -793,16 +922,42 @@ class ArxivRetriever(BaseRetriever):
         arxiv_client = _ARXIV.Client(num_retries=5, delay_seconds=5)
 
         def fetch_batch(batch_ids: list[str]) -> list[ArxivResult]:
-            search = _ARXIV.Search(id_list=batch_ids)
+            search = _ARXIV.Search(id_list=batch_ids, max_results=len(batch_ids))
             return list(arxiv_client.results(search))
 
-        batches = [paper_ids[i : i + 20] for i in range(0, len(paper_ids), 20)]
-        max_workers = int(get_config_value(self.config, "executor.arxiv_fetch_workers"))
-        max_workers = min(max_workers, len(batches)) or 1
+        def fetch_batch_with_fallback(batch_ids: list[str]) -> list[ArxivResult]:
+            try:
+                _wait_for_arxiv_request_slot()
+                return fetch_batch(batch_ids)
+            except Exception as exc:
+                if not _looks_like_oversized_arxiv_request(exc):
+                    logger.warning(
+                        f"Failed to fetch {len(batch_ids)} arxiv paper details: {exc}"
+                    )
+                    return []
+                if len(batch_ids) <= 1:
+                    logger.warning(
+                        f"Failed to fetch arxiv paper details for {batch_ids[0]}: {exc}"
+                    )
+                    return []
 
-        results: list[list[ArxivResult]] = parallel_execute(
-            fetch_batch, batches, max_workers=max_workers, desc="Fetching paper details"
+                midpoint = len(batch_ids) // 2
+                logger.warning(
+                    f"Failed to fetch {len(batch_ids)} arxiv paper details; "
+                    f"retrying as batches of {midpoint} and {len(batch_ids) - midpoint}: {exc}"
+                )
+                return fetch_batch_with_fallback(
+                    batch_ids[:midpoint]
+                ) + fetch_batch_with_fallback(batch_ids[midpoint:])
+
+        batch_size = max(
+            1,
+            int(get_config_value(self.config, "executor.arxiv_id_batch_size", 50)),
         )
+        batches = [paper_ids[i : i + batch_size] for i in range(0, len(paper_ids), batch_size)]
+        results: list[list[ArxivResult]] = []
+        for batch in tqdm(batches, desc="Fetching paper details"):
+            results.append(fetch_batch_with_fallback(batch))
 
         raw_papers: list[ArxivResult] = []
         for batch_papers in results:
