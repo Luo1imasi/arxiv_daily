@@ -17,6 +17,19 @@
             <button class="btn btn-primary" onclick="triggerRun()" id="runBtn">
                 Run Now
             </button>
+            <div class="backfill-controls">
+                <label class="backfill-date-label">
+                    <span>From</span>
+                    <input type="date" id="backfillStartDate" aria-label="Backfill start date">
+                </label>
+                <label class="backfill-date-label">
+                    <span>To</span>
+                    <input type="date" id="backfillEndDate" aria-label="Backfill end date">
+                </label>
+                <button type="button" class="btn btn-secondary" onclick="triggerBackfill()" id="backfillBtn">
+                    Backfill
+                </button>
+            </div>
         </div>
     </nav>
 
@@ -81,12 +94,30 @@
             {% endif %}
 
             {% for paper in papers %}
-            <div class="paper-card" data-score="{{ paper.score or 0 }}">
+            {% set score = paper.score or 0 %}
+            {% if score >= 8.5 %}
+                {% set score_tier = "score-tier-excellent" %}
+                {% set score_label = "Top pick" %}
+            {% elif score >= 7.0 %}
+                {% set score_tier = "score-tier-strong" %}
+                {% set score_label = "Strong" %}
+            {% elif score >= 5.5 %}
+                {% set score_tier = "score-tier-good" %}
+                {% set score_label = "Good" %}
+            {% else %}
+                {% set score_tier = "score-tier-watch" %}
+                {% set score_label = "Candidate" %}
+            {% endif %}
+            <div class="paper-card {{ score_tier }}" data-score="{{ score }}">
                 <div class="paper-header">
                     <h3 class="paper-title">
                         <a href="{{ paper.url }}" target="_blank" rel="noopener noreferrer">{{ paper.title }}</a>
                     </h3>
-                    <span class="paper-score">{{ "%.1f"|format(paper.score or 0) }}</span>
+                    <span class="paper-score">
+                        <span class="paper-score-value">{{ "%.1f"|format(score) }}</span>
+                        <span class="paper-score-label">{{ score_label }}</span>
+                        <span class="paper-score-note">daily relative</span>
+                    </span>
                 </div>
 
                 <div class="paper-meta">
@@ -241,7 +272,7 @@
                         <div class="form-row">
                             <div class="form-group">
                                 <label>Max Paper Number</label>
-                                <input type="number" name="max_paper_num" id="cfg_max_paper_num" value="100" min="1" max="1000">
+                                <input type="number" name="max_paper_num" id="cfg_max_paper_num" value="20" min="1" max="1000">
                             </div>
                         </div>
                     </div>
@@ -286,15 +317,31 @@
         return { resp, data };
     }
 
+    async function fetchMutationJson(url, options = {}) {
+        const password = window.prompt('请输入操作密码以继续修改性操作：');
+        if (password === null) {
+            throw new Error('操作已取消');
+        }
+
+        const headers = new Headers(options.headers || {});
+        headers.set('X-Admin-Password', password);
+        return await fetchJson(url, {
+            ...options,
+            headers,
+        });
+    }
+
     function setTaskState(data = {}) {
         const running = Boolean(data.running);
         const taskName = data.task_name || 'task';
         const runBtn = document.getElementById('runBtn');
+        const backfillBtn = document.getElementById('backfillBtn');
         const reloadBtn = document.getElementById('reloadCorpusBtn');
         const banner = document.getElementById('taskBanner');
         const bannerText = document.getElementById('taskBannerText');
 
         runBtn.disabled = running;
+        if (backfillBtn) backfillBtn.disabled = running;
         if (reloadBtn) reloadBtn.disabled = running;
 
         if (running) {
@@ -306,6 +353,27 @@
             banner.classList.add('hidden');
             bannerText.textContent = 'No task is running.';
         }
+    }
+
+    function todayDateString() {
+        return new Date().toISOString().slice(0, 10);
+    }
+
+    function defaultBackfillStartDate() {
+        const value = new Date();
+        value.setDate(value.getDate() - 7);
+        return value.toISOString().slice(0, 10);
+    }
+
+    function setupBackfillDateInputs() {
+        const today = todayDateString();
+        const startInput = document.getElementById('backfillStartDate');
+        const endInput = document.getElementById('backfillEndDate');
+        if (!startInput || !endInput) return;
+        startInput.max = today;
+        endInput.max = today;
+        if (!startInput.value) startInput.value = defaultBackfillStartDate();
+        if (!endInput.value) endInput.value = today;
     }
 
     async function fetchTaskStatus(showErrors=false) {
@@ -338,12 +406,51 @@
     async function triggerRun() {
         setTaskState({running: true, task_name: 'daily recommendation'});
         try {
-            const { resp, data } = await fetchJson(API_BASE + '/api/run', {method: 'POST'});
+            const { resp, data } = await fetchMutationJson(API_BASE + '/api/run', {method: 'POST'});
             if (resp.ok) {
                 showToast('Task started! This may take a few minutes.', 'success');
                 pollStatus();
             } else {
                 showToast(data.detail || 'Failed to start task', 'error');
+                await fetchTaskStatus();
+            }
+        } catch(e) {
+            showToast('Error: ' + e.message, 'error');
+            await fetchTaskStatus();
+        }
+    }
+
+    async function triggerBackfill() {
+        setupBackfillDateInputs();
+        const today = todayDateString();
+        const startDateInput = document.getElementById('backfillStartDate');
+        const endDateInput = document.getElementById('backfillEndDate');
+        const startDate = startDateInput.value;
+        const endDate = endDateInput.value;
+        if (!startDate || !endDate) {
+            showToast('Please choose both backfill dates.', 'error');
+            return;
+        }
+        if (startDate > today || endDate > today) {
+            showToast('Backfill dates cannot be later than today.', 'error');
+            return;
+        }
+        if (startDate > endDate) {
+            showToast('Start date must be older than or equal to end date.', 'error');
+            return;
+        }
+        setTaskState({running: true, task_name: 'recommendation backfill'});
+        try {
+            const { resp, data } = await fetchMutationJson(API_BASE + '/api/run-until', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({start_date: startDate, end_date: endDate}),
+            });
+            if (resp.ok) {
+                showToast(`Backfill started from ${startDate} to ${endDate}. Existing days will be overwritten.`, 'success');
+                pollStatus();
+            } else {
+                showToast(data.detail || 'Failed to start backfill', 'error');
                 await fetchTaskStatus();
             }
         } catch(e) {
@@ -443,7 +550,7 @@
             document.getElementById('cfg_llm_language').value = cfg.llm?.language || 'Chinese';
             document.getElementById('cfg_schedule_hour').value = cfg.executor?.schedule_hour ?? 8;
             document.getElementById('cfg_schedule_minute').value = cfg.executor?.schedule_minute ?? 0;
-            document.getElementById('cfg_max_paper_num').value = cfg.executor?.max_paper_num ?? 100;
+            document.getElementById('cfg_max_paper_num').value = cfg.executor?.max_paper_num ?? 20;
             document.getElementById('cfg_timezone').value = cfg.executor?.timezone || 'Asia/Shanghai';
         } catch(e) {
             console.error('Failed to load settings:', e);
@@ -476,7 +583,7 @@
                 language: document.getElementById('cfg_llm_language').value,
             },
             executor: {
-                max_paper_num: getInputInt('cfg_max_paper_num', 100),
+                max_paper_num: getInputInt('cfg_max_paper_num', 20),
                 timezone: document.getElementById('cfg_timezone').value || 'Asia/Shanghai',
                 schedule_hour: getInputInt('cfg_schedule_hour', 8),
                 schedule_minute: getInputInt('cfg_schedule_minute', 0),
@@ -485,7 +592,7 @@
         };
 
         try {
-            const { resp } = await fetchJson(API_BASE + '/api/config', {
+            const { resp } = await fetchMutationJson(API_BASE + '/api/config', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify(config),
@@ -507,7 +614,7 @@
         result.className = '';
         const localPath = document.getElementById('cfg_webdav_local_path').value;
         try {
-            const { data } = await fetchJson(API_BASE + '/api/webdav/test', {
+            const { data } = await fetchMutationJson(API_BASE + '/api/webdav/test', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({
@@ -538,7 +645,7 @@
     async function reloadCorpus() {
         try {
             setTaskState({running: true, task_name: 'corpus reload'});
-            const { resp, data } = await fetchJson(API_BASE + '/api/corpus/reload', {method: 'POST'});
+            const { resp, data } = await fetchMutationJson(API_BASE + '/api/corpus/reload', {method: 'POST'});
             if (resp.ok) {
                 showToast('Corpus reload started. This may take a while.', 'success');
                 pollStatus();
@@ -557,7 +664,7 @@
         result.textContent = 'Testing...';
         result.className = '';
         try {
-            const { data } = await fetchJson(API_BASE + '/api/llm/test', {
+            const { data } = await fetchMutationJson(API_BASE + '/api/llm/test', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({
@@ -667,6 +774,7 @@
     })();
 
     (async function initPageState() {
+        setupBackfillDateInputs();
         const data = await fetchTaskStatus(true);
         if (data?.running) {
             pollStatus();
