@@ -19,6 +19,14 @@ def _remove_think_tags(content: str) -> str:
     return content
 
 
+def _content_was_think_only(content: str) -> bool:
+    """Check if the response contained only reasoning/think tags (common with reasoning models)."""
+    if not content:
+        return False
+    stripped = _remove_think_tags(content)
+    return bool(content) and not stripped
+
+
 _client_cache: dict[tuple[Any, Any], OpenAI] = {}
 _client_cache_lock = threading.Lock()
 _llm_request_semaphore_lock = threading.Lock()
@@ -192,16 +200,45 @@ def generate_tldr(paper: Any, config: dict[str, Any]) -> str:
         {"role": "user", "content": prompt},
     ]
 
-    try:
-        content = _call_llm_api_with_retry(config, messages, max_tokens=256)
+    max_content_retries = 2
+    for attempt in range(max_content_retries + 1):
+        try:
+            content = _call_llm_api_with_retry(config, messages, max_tokens=1000)
+        except Exception as e:
+            logger.warning(f"LLM API call failed for {paper.url}: {e}")
+            return ""
+
+        if not content:
+            logger.warning(
+                f"LLM returned empty response for {paper.url}"
+                f"{f' (attempt {attempt + 1}/{max_content_retries + 1})' if attempt > 0 else ''}"
+            )
+            if attempt < max_content_retries:
+                continue
+            return ""
+
+        if _content_was_think_only(content):
+            logger.warning(
+                f"LLM response contained only reasoning/think tags for {paper.url}"
+                f"{f' (attempt {attempt + 1}/{max_content_retries + 1})' if attempt > 0 else ''}"
+            )
+            if attempt < max_content_retries:
+                continue
+            return ""
+
         result = _extract_json_object(content)
         if result:
             return result.get("tldr", "")
-        logger.warning(f"Failed to parse TLDR JSON from response for {paper.url}")
+
+        logger.warning(
+            f"Failed to parse TLDR JSON from response for {paper.url}. "
+            f"Raw response (first 500 chars): {content[:500]!r}"
+        )
+        if attempt < max_content_retries:
+            continue
         return ""
-    except Exception as e:
-        logger.warning(f"Failed to generate TLDR for {paper.url}: {e}")
-        return ""
+
+    return ""
 def extract_keywords_from_paper(
     title: str, abstract: str, config: dict[str, Any], max_keywords: int = 5
 ) -> list[str]:
