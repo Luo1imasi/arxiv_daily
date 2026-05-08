@@ -16,9 +16,13 @@
 
 ## 快速开始
 
-安装：
+安装（CPU 版 PyTorch，无需 CUDA）：
 
 ```bash
+# 1. 先安装 CPU 版 PyTorch（约 200MB）
+pip install "torch>=2.0.0" --index-url https://download.pytorch.org/whl/cpu
+
+# 2. 再安装项目及其余依赖
 pip install -e .
 ```
 
@@ -88,7 +92,11 @@ tests/                 测试
 安装开发依赖：
 
 ```bash
-pip install -e .[dev]
+# 1. 先安装 CPU 版 PyTorch（约 200MB）
+pip install "torch>=2.0.0" --index-url https://download.pytorch.org/whl/cpu
+
+# 2. 再安装项目及开发依赖
+pip install -e ".[dev]"
 ```
 
 运行测试：
