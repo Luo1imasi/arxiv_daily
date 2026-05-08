@@ -29,7 +29,7 @@ _ARXIV = cast(Any, arxiv)
 _FEEDPARSER = cast(Any, feedparser)
 _ARXIV_REQUEST_LOCK = threading.Lock()
 _last_arxiv_request_at = 0.0
-_ARXIV_MIN_REQUEST_INTERVAL_SECONDS = 3.0
+_ARXIV_MIN_REQUEST_INTERVAL_SECONDS = 5.0
 
 TOKEN_PATTERN = re.compile(r"[a-z][a-z0-9+\-\.]{1,}")
 STOPWORDS = {
@@ -919,7 +919,13 @@ class ArxivRetriever(BaseRetriever):
         if not paper_ids:
             return []
 
-        arxiv_client = _ARXIV.Client(num_retries=5, delay_seconds=5)
+        batch_size = max(
+            1,
+            int(get_config_value(self.config, "executor.arxiv_id_batch_size", 50)),
+        )
+        arxiv_client = _ARXIV.Client(
+            num_retries=5, delay_seconds=5, page_size=batch_size
+        )
 
         def fetch_batch(batch_ids: list[str]) -> list[ArxivResult]:
             search = _ARXIV.Search(id_list=batch_ids, max_results=len(batch_ids))
@@ -949,11 +955,6 @@ class ArxivRetriever(BaseRetriever):
                 return fetch_batch_with_fallback(
                     batch_ids[:midpoint]
                 ) + fetch_batch_with_fallback(batch_ids[midpoint:])
-
-        batch_size = max(
-            1,
-            int(get_config_value(self.config, "executor.arxiv_id_batch_size", 50)),
-        )
         batches = [paper_ids[i : i + batch_size] for i in range(0, len(paper_ids), batch_size)]
         results: list[list[ArxivResult]] = []
         for batch in tqdm(batches, desc="Fetching paper details"):
