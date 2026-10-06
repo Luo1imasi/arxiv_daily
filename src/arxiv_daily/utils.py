@@ -101,8 +101,14 @@ def retry_call(
             return func(*args, **kwargs)
         except exceptions as e:
             last_exception = e
+            if getattr(e, "retryable", True) is False:
+                raise
             if attempt < max_retries - 1:
-                delay = min(base_delay * (2**attempt), max_delay)
+                retry_after = getattr(e, "retry_after", None)
+                if retry_after is not None:
+                    delay = min(max(float(retry_after), 0.0), max_delay)
+                else:
+                    delay = min(base_delay * (2**attempt), max_delay)
                 logger.warning(
                     f"{func.__name__} failed (attempt {attempt + 1}/{max_retries}): {e}. "
                     f"Retrying in {delay:.1f}s..."

@@ -15,6 +15,10 @@ source:
     keyword_max_doc_freq: 0.6
     candidate_cache_ttl_minutes: 180
     keyword_fallback_min_results: 20
+    keyword_query_max_groups: 3
+    keyword_query_group_size: 3
+    keyword_query_max_results: 80
+    semantic_mix: 0.45
     pre_rerank_limit: 120
     use_bm25_scoring: true
     min_keyword_matches: 1
@@ -28,8 +32,12 @@ llm:
   api_key: ""
   base_url: "https://api.openai.com/v1"
   model: "gpt-4o-mini"
+  models:
+    extract: "gpt-4o-mini"
+    summarize: "gpt-4o-mini"
+    judge: "gpt-4o-mini"
   language: "Chinese"
-  timeout: 60.0
+  timeout: 180.0
   max_retries: 3
   base_delay: 1.0
   max_concurrent_requests: 2
@@ -56,9 +64,11 @@ executor:
   schedule_hour: 8
   schedule_minute: 0
   manifest_ttl_minutes: 30
-  retriever_workers: 4
-  corpus_workers: 8
-  llm_workers: 4
+  retriever_workers: 2
+  corpus_workers: 4
+  llm_workers: 2
+  thread_pool_workers: 8
+  judge_pool_size: 24
   arxiv_id_batch_size: 50
 
 server:
