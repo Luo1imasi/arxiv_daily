@@ -5,7 +5,6 @@ import re
 import threading
 import time as time_module
 from collections import Counter
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any, cast, override
 
@@ -18,8 +17,6 @@ from tqdm import tqdm
 from .base import BaseRetriever, register_retriever
 from ..protocol import Paper, CorpusPaper
 from ..config import get_config_value
-from ..utils import make_content_key
-from ..llm import extract_keywords_from_paper
 from .. import database as db
 from ..business_date import business_window_utc as _business_window_utc
 from ..business_date import get_business_date as _business_date
@@ -119,6 +116,72 @@ def _wait_for_arxiv_request_slot() -> None:
         if elapsed < _ARXIV_MIN_REQUEST_INTERVAL_SECONDS:
             time_module.sleep(_ARXIV_MIN_REQUEST_INTERVAL_SECONDS - elapsed)
         _last_arxiv_request_at = time_module.monotonic()
+
+
+def _sleep_for_retry(seconds: float) -> None:
+    time_module.sleep(max(0.0, seconds))
+
+
+def _is_retryable_arxiv_failure(exc: Exception) -> bool:
+    status = getattr(exc, "status", None) or getattr(exc, "status_code", None)
+    if status in {406, 429, 503}:
+        return True
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "429",
+            "503",
+            "406",
+            "too many requests",
+            "service unavailable",
+            "not acceptable",
+        )
+    )
+
+
+def _arxiv_retry_after(exc: Exception) -> float | None:
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None) if response is not None else getattr(exc, "headers", None)
+    if headers is None:
+        return None
+    raw = None
+    try:
+        raw = headers.get("Retry-After") or headers.get("retry-after")
+    except Exception:
+        raw = None
+    if raw is None:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return None
+
+
+def _run_arxiv_call(func, *, description: str):
+    max_attempts = 3
+    last_exception: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            _wait_for_arxiv_request_slot()
+            return func()
+        except Exception as exc:
+            last_exception = exc
+            if _looks_like_oversized_arxiv_request(exc) or not _is_retryable_arxiv_failure(exc):
+                raise
+            if attempt >= max_attempts - 1:
+                raise
+            delay = _arxiv_retry_after(exc)
+            if delay is None:
+                delay = min(20 * (2**attempt), 120)
+            logger.warning(
+                f"arXiv {description} failed ({exc}). Retrying in {delay:.0f}s "
+                f"(attempt {attempt + 1}/{max_attempts})"
+            )
+            _sleep_for_retry(delay)
+    if last_exception is not None:
+        raise last_exception
+    raise RuntimeError(f"arXiv {description} failed")
 
 
 def _looks_like_oversized_arxiv_request(exc: Exception) -> bool:
@@ -421,6 +484,8 @@ class ArxivRetriever(BaseRetriever):
             float(get_config_value(config, "source.arxiv.recency_half_life_days")),
         )
         self.business_date = _business_date(config)
+        self._active_terms: list[str] = []
+        self._negative_terms: list[str] = []
         if "arxiv_fetch_workers" in self.executor_config:
             logger.warning(
                 "executor.arxiv_fetch_workers is deprecated and ignored; "
@@ -443,6 +508,7 @@ class ArxivRetriever(BaseRetriever):
             "start_days_ago": int(start_days_ago),
             "recent_days": lookback_end,
             "recent_max_results": int(get_config_value(self.config, "source.arxiv.recent_max_results")),
+            "query_terms": [term.lower() for term in self._active_terms],
         }
         return hashlib.sha1(repr(payload).encode("utf-8")).hexdigest()
 
@@ -464,27 +530,28 @@ class ArxivRetriever(BaseRetriever):
             return self._rss_based_retrieval(categories)
 
     def _keyword_based_retrieval(self, categories: list[str]) -> list[RawPaper]:
-        candidate_pool = self._collect_candidate_pool(
-            categories,
-            start_days_ago=0,
-            end_days_ago=self.initial_recent_days,
-        )
-        if not candidate_pool:
-            logger.warning("No candidate papers collected from arXiv")
-            return []
-
-        if not self._corpus:
-            logger.warning("No corpus for keyword extraction, returning all collected papers")
-            return candidate_pool
-
-        keywords = asyncio.run(self._get_aggregated_keywords())
-
-        if not keywords:
-            logger.warning("Failed to aggregate keywords, returning all collected papers")
-            return candidate_pool
-
-        logger.info(f"Using {len(keywords)} keywords: {keywords[:10]}...")
-        return self._retrieve_with_adaptive_lookback(categories, keywords, candidate_pool)
+        keywords: list[str] = []
+        if self._corpus:
+            keywords, negative_terms = asyncio.run(self._resolve_search_terms())
+            self._negative_terms = negative_terms
+        else:
+            logger.warning("No corpus for keyword extraction, using category retrieval")
+        self._active_terms = keywords
+        try:
+            candidate_pool = self._collect_candidate_pool(
+                categories,
+                start_days_ago=0,
+                end_days_ago=self.initial_recent_days,
+            )
+            if not candidate_pool:
+                logger.warning("No candidate papers collected from arXiv")
+                return []
+            if not keywords:
+                return candidate_pool
+            logger.info(f"Using {len(keywords)} keywords: {keywords[:10]}...")
+            return self._retrieve_with_adaptive_lookback(categories, keywords, candidate_pool)
+        finally:
+            self._active_terms = []
 
     def _retrieve_with_adaptive_lookback(
         self,
@@ -539,89 +606,40 @@ class ArxivRetriever(BaseRetriever):
             return True
         return False
 
-    async def _get_aggregated_keywords(self) -> list[str]:
-        corpus_for_keywords = self._select_corpus_for_keywords()
-        logger.info(f"Loading keywords for {len(corpus_for_keywords)} corpus papers...")
-        cached_keywords = await db.load_keywords_for_papers(corpus_for_keywords)
-        logger.info(f"Loaded {len(cached_keywords)} cached keywords")
+    async def _resolve_search_terms(self) -> tuple[list[str], list[str]]:
+        profile = self.config.get("interest_profile") or {}
+        if not isinstance(profile, dict):
+            profile = {}
+        terms = [
+            str(term).strip()
+            for term in profile.get("canonical_terms") or []
+            if str(term).strip()
+        ]
+        negative = [
+            str(term).strip()
+            for term in profile.get("not_interested") or []
+            if str(term).strip()
+        ]
+        feedback = await db.list_feedback()
+        negative_counts: Counter[str] = Counter()
+        for row in feedback:
+            if row.get("vote") != "irrelevant":
+                continue
+            negative_counts.update(_tokenize(str(row.get("title") or "")))
+        for term, _count in negative_counts.most_common(12):
+            if term not in negative:
+                negative.append(term)
+        if terms:
+            limited = terms[: self.max_keywords]
+            logger.info(f"Using {len(limited)} canonical terms from the interest profile")
+            return limited, negative
 
         local_keywords = _extract_local_keywords_from_corpus(
-            corpus_for_keywords,
-            limit=max(self.max_keywords * 3, 30),
+            self._select_corpus_for_keywords(),
+            limit=self.max_keywords,
         )
-
-        llm_enabled = bool(self.config.get("llm", {}).get("api_key"))
-        papers_to_extract: list[CorpusPaper] = []
-        if llm_enabled:
-            for paper in corpus_for_keywords:
-                cache_key = make_content_key(paper.title, paper.abstract or "")
-                if cache_key not in cached_keywords:
-                    papers_to_extract.append(paper)
-
-        if papers_to_extract:
-            logger.info(
-                f"Extracting keywords for {len(papers_to_extract)} new papers..."
-            )
-            def extract_single(paper: CorpusPaper) -> tuple[CorpusPaper, list[str]]:
-                keywords = extract_keywords_from_paper(
-                    paper.title, paper.abstract or "", self.config, max_keywords=5
-                )
-                return paper, keywords
-
-            extracted_results: list[tuple[CorpusPaper, list[str]]] = []
-            max_workers = int(get_config_value(self.config, "executor.llm_workers"))
-            with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                futures: dict[Future[tuple[CorpusPaper, list[str]]], CorpusPaper] = {
-                    pool.submit(extract_single, p): p for p in papers_to_extract
-                }
-                for future in tqdm(
-                    as_completed(futures),
-                    total=len(futures),
-                    desc="Extracting keywords",
-                ):
-                    try:
-                        paper, keywords = future.result()
-                        if keywords:
-                            extracted_results.append((paper, keywords))
-                    except Exception as e:
-                        logger.warning(f"Failed to extract keywords: {e}")
-
-            for paper, keywords in extracted_results:
-                cache_key = make_content_key(paper.title, paper.abstract or "")
-                await db.save_keyword_cache(paper.title, paper.abstract or "", keywords)
-                cached_keywords[cache_key] = keywords
-
-        total_docs = max(len(corpus_for_keywords), 1)
-        keyword_doc_freq: dict[str, float] = {}
-        keyword_weight: dict[str, float] = {}
-        for keyword in local_keywords:
-            keyword_doc_freq[keyword] = keyword_doc_freq.get(keyword, 0) + 1
-            keyword_weight[keyword] = keyword_weight.get(keyword, 0.0) + 1.25
-
-        for cache_key, kw_list in cached_keywords.items():
-            for kw in {k.lower().strip() for k in kw_list}:
-                kw_lower = kw.lower().strip()
-                if kw_lower and len(kw_lower) > 2:
-                    keyword_doc_freq[kw_lower] = keyword_doc_freq.get(kw_lower, 0) + 1
-                    keyword_weight[kw_lower] = keyword_weight.get(kw_lower, 0.0) + 1.0
-
-        keyword_scores: list[tuple[str, float, float]] = []
-        for keyword, doc_freq in keyword_doc_freq.items():
-            if total_docs >= 10 and doc_freq / total_docs > self.keyword_max_doc_freq:
-                continue
-            idf = math.log((total_docs + 1) / (doc_freq + 1)) + 1.0
-            score = keyword_weight.get(keyword, 0.0) * idf
-            keyword_scores.append((keyword, score, doc_freq))
-
-        sorted_keywords = sorted(keyword_scores, key=lambda item: (-item[1], -item[2], item[0]))
-        top_keywords = [kw for kw, _, _ in sorted_keywords[: self.max_keywords]]
-
-        logger.info(
-            f"Aggregated {len(top_keywords)} keywords from {len(cached_keywords)} papers"
-        )
-        if top_keywords:
-            logger.debug(f"Top keywords: {top_keywords}")
-        return top_keywords
+        logger.info(f"Using {len(local_keywords)} local fallback keywords")
+        return local_keywords, negative
 
     def _select_corpus_for_keywords(self) -> list[CorpusPaper]:
         if not self._corpus:
@@ -753,49 +771,161 @@ class ArxivRetriever(BaseRetriever):
         if lookback_days <= 0 or max_results <= 0 or start_days_ago >= lookback_days:
             return []
 
-        query = " OR ".join(f"cat:{category}" for category in categories)
         window_start, window_end = _business_window_utc(
             self.config,
             start_days_ago=start_days_ago,
             end_days_ago=lookback_days,
         )
-        query = f"({query}) AND submittedDate:[{_arxiv_date(window_start)} TO {_arxiv_date(window_end)}]"
+        date_clause = (
+            f"submittedDate:[{_arxiv_date(window_start)} TO {_arxiv_date(window_end)}]"
+        )
+        include_cross = bool(get_config_value(self.config, "source.arxiv.include_cross_list"))
+        term_queries = self._term_search_queries(self._active_terms)
+        papers: list[RawPaper] = []
+        if term_queries:
+            per_query = min(
+                max_results,
+                int(get_config_value(self.config, "source.arxiv.keyword_query_max_results", 80)),
+            )
+            failures: list[Exception] = []
+            for term_query in term_queries:
+                try:
+                    papers.extend(
+                        self._search_arxiv(
+                            f"{term_query} AND {date_clause}",
+                            per_query,
+                            window_start,
+                            window_end,
+                            categories,
+                            include_cross=include_cross,
+                        )
+                    )
+                except Exception as exc:
+                    failures.append(exc)
+                    logger.warning(f"arXiv term query failed: {exc}")
+            papers = [
+                _to_raw_paper(paper)
+                for paper in _dedupe_arxiv_results(papers)
+            ]
+            if not papers and failures:
+                raise failures[-1]
+            if not papers:
+                logger.warning(
+                    "Canonical term queries returned no papers; using one capped category query"
+                )
+                category_query = " OR ".join(f"cat:{category}" for category in categories)
+                papers = self._search_arxiv(
+                    f"({category_query}) AND {date_clause}",
+                    min(max_results, 100),
+                    window_start,
+                    window_end,
+                    categories,
+                    include_cross=include_cross,
+                )
+        else:
+            category_query = " OR ".join(f"cat:{category}" for category in categories)
+            papers = self._search_arxiv(
+                f"({category_query}) AND {date_clause}",
+                max_results,
+                window_start,
+                window_end,
+                categories,
+                include_cross=include_cross,
+            )
+
+        if bool(self.executor_config.get("debug", False)):
+            papers = papers[:20]
+        logger.info(f"Fetched {len(papers)} recent papers from category search")
+        return papers
+
+    def _term_search_queries(self, terms: list[str]) -> list[str]:
+        group_size = max(1, int(get_config_value(self.config, "source.arxiv.keyword_query_group_size", 3)))
+        max_groups = max(1, int(get_config_value(self.config, "source.arxiv.keyword_query_max_groups", 3)))
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for term in terms:
+            safe = re.sub(r'["\\]', "", str(term)).strip()
+            key = safe.lower()
+            if len(safe) < 3 or key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(safe)
+        cleaned = cleaned[: group_size * max_groups]
+        queries = []
+        for start in range(0, len(cleaned), group_size):
+            parts = []
+            for term in cleaned[start : start + group_size]:
+                if " " in term:
+                    parts.append(f'abs:"{term}"')
+                    parts.append(f'ti:"{term}"')
+                else:
+                    parts.append(f"abs:{term}")
+                    parts.append(f"ti:{term}")
+            if parts:
+                queries.append("(" + " OR ".join(parts) + ")")
+        return queries
+
+    def _search_arxiv(
+        self,
+        query: str,
+        max_results: int,
+        window_start: datetime,
+        window_end: datetime,
+        categories: list[str],
+        *,
+        include_cross: bool,
+    ) -> list[RawPaper]:
+        if max_results <= 0:
+            return []
         search = _ARXIV.Search(
             query=query,
             max_results=max_results,
             sort_by=_ARXIV.SortCriterion.SubmittedDate,
             sort_order=_ARXIV.SortOrder.Descending,
         )
-        client = _ARXIV.Client(num_retries=5, delay_seconds=5, page_size=min(max_results, 2000))
-        papers: list[RawPaper] = []
-        include_cross = bool(get_config_value(self.config, "source.arxiv.include_cross_list"))
-        _wait_for_arxiv_request_slot()
-        for result in client.results(search):
-            raw_paper = _to_raw_paper(result)
-            published = _paper_published(raw_paper)
-            if not _published_in_window(
-                published,
-                window_start,
-                window_end,
-            ):
-                if published is None:
-                    continue
-                published_utc = (
-                    published.replace(tzinfo=timezone.utc)
-                    if published.tzinfo is None
-                    else published.astimezone(timezone.utc)
-                )
-                if published_utc < window_start:
-                    break
-                continue
-            if not _matches_category_policy(raw_paper, categories, include_cross=include_cross):
-                continue
-            papers.append(raw_paper)
+        client = _ARXIV.Client(num_retries=2, delay_seconds=5, page_size=min(max_results, 200))
 
-        if bool(self.executor_config.get("debug", False)):
-            papers = papers[:20]
-        logger.info(f"Fetched {len(papers)} recent papers from category search")
-        return papers
+        def _fetch() -> list[RawPaper]:
+            found: list[RawPaper] = []
+            for result in client.results(search):
+                raw_paper = _to_raw_paper(result)
+                published = _paper_published(raw_paper)
+                if not _published_in_window(published, window_start, window_end):
+                    if published is None:
+                        continue
+                    published_utc = (
+                        published.replace(tzinfo=timezone.utc)
+                        if published.tzinfo is None
+                        else published.astimezone(timezone.utc)
+                    )
+                    if published_utc < window_start:
+                        break
+                    continue
+                if not _matches_category_policy(raw_paper, categories, include_cross=include_cross):
+                    continue
+                found.append(raw_paper)
+            return found
+
+        return _run_arxiv_call(_fetch, description="search")
+
+    def _semantic_scores(self, papers: list[RawPaper]) -> dict[str, float]:
+        if not papers or not self._corpus:
+            return {}
+        try:
+            from ..reranker.local import semantic_scores_for_raw_papers
+
+            profile = self.config.get("interest_profile") or {}
+            query = ""
+            if isinstance(profile, dict):
+                query = str(profile.get("summary") or "")
+                if not query:
+                    query = " ".join(str(item) for item in (profile.get("topics") or []))
+            return semantic_scores_for_raw_papers(
+                self.config, papers, self._corpus, query or None
+            )
+        except Exception as exc:
+            logger.warning(f"Semantic coarse ranking skipped: {exc}")
+            return {}
 
     def _rank_candidate_pool(
         self, papers: list[RawPaper], keywords: list[str]
@@ -812,7 +942,19 @@ class ArxivRetriever(BaseRetriever):
         use_bm25 = bool(get_config_value(self.config, "source.arxiv.use_bm25_scoring"))
         bm25_scores = _compute_bm25_scores(papers, keywords) if use_bm25 else {}
         bm25_scores = _normalize_scores(bm25_scores)
+        semantic_scores = self._semantic_scores(papers)
+        semantic_values = list(semantic_scores.values())
+        semantic_min = min(semantic_values) if semantic_values else 0.0
+        semantic_max = max(semantic_values) if semantic_values else 0.0
+        semantic_mix = float(get_config_value(self.config, "source.arxiv.semantic_mix", 0.45))
         fallback_target = max(self.keyword_fallback_min_results, self.pre_rerank_limit)
+
+        def _semantic_norm(paper_id: str) -> float:
+            if not semantic_scores or semantic_max <= semantic_min:
+                return 0.0
+            return (semantic_scores.get(paper_id, semantic_min) - semantic_min) / (
+                semantic_max - semantic_min
+            )
 
         def _recency_bonus(published: datetime | None) -> float:
             if published is None:
@@ -832,16 +974,30 @@ class ArxivRetriever(BaseRetriever):
         seen_ids: set[str] = set()
         for paper in papers:
             match_score, match_count = _compute_keyword_match_score(paper, keywords)
-            bm25_score = bm25_scores.get(_paper_entry_id(paper), 0.0)
+            paper_id = _paper_entry_id(paper)
+            bm25_score = bm25_scores.get(paper_id, 0.0)
+            semantic_norm = _semantic_norm(paper_id)
+            negative_score, negative_count = (
+                _compute_keyword_match_score(paper, self._negative_terms)
+                if self._negative_terms
+                else (0.0, 0.0)
+            )
 
             published = _paper_published(paper)
             recency_bonus = _recency_bonus(published)
 
-            retrieval_score = match_score + bm25_score * 4.0
+            text_score = match_score + bm25_score * 4.0
+            if semantic_scores:
+                retrieval_score = (1.0 - semantic_mix) * text_score + semantic_mix * (
+                    semantic_norm * 4.0
+                )
+            else:
+                retrieval_score = text_score
+            if negative_count and match_count == 0:
+                retrieval_score -= min(negative_score, 4.0)
             hybrid_score = retrieval_score + recency_bonus * 0.75
             lookback_score = hybrid_score * (1.0 + min(match_count, 3.0))
-            if match_count >= min_match_count or hybrid_score >= 1.5:
-                paper_id = _paper_entry_id(paper)
+            if match_count >= min_match_count or hybrid_score >= 1.5 or semantic_norm >= 0.72:
                 if paper_id not in seen_ids:
                     seen_ids.add(paper_id)
                     scored_papers.append(
@@ -924,16 +1080,18 @@ class ArxivRetriever(BaseRetriever):
             int(get_config_value(self.config, "executor.arxiv_id_batch_size", 50)),
         )
         arxiv_client = _ARXIV.Client(
-            num_retries=5, delay_seconds=5, page_size=batch_size
+            num_retries=2, delay_seconds=5, page_size=batch_size
         )
 
         def fetch_batch(batch_ids: list[str]) -> list[ArxivResult]:
             search = _ARXIV.Search(id_list=batch_ids, max_results=len(batch_ids))
-            return list(arxiv_client.results(search))
+            return _run_arxiv_call(
+                lambda: list(arxiv_client.results(search)),
+                description="id lookup",
+            )
 
         def fetch_batch_with_fallback(batch_ids: list[str]) -> list[ArxivResult]:
             try:
-                _wait_for_arxiv_request_slot()
                 return fetch_batch(batch_ids)
             except Exception as exc:
                 if not _looks_like_oversized_arxiv_request(exc):
