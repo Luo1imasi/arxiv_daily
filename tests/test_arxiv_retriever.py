@@ -940,34 +940,27 @@ class RssEntryParsingTests(unittest.TestCase):
         self.assertEqual(retriever.id_fallback_count, 1)
 
 
-class SemanticPrefilterTests(unittest.TestCase):
+class PrefilterLimitTests(unittest.TestCase):
     def _retriever(self, **arxiv: object) -> ArxivRetriever:
         source = {
             "category": ["cs.AI"],
             "use_bm25_scoring": False,
             "min_keyword_matches": 1,
-            "semantic_prefilter_limit": 2,
-            "pre_rerank_limit": 10,
+            "llm_prefilter_limit": 2,
             "keyword_fallback_min_results": 10,
             "recency_half_life_days": 14,
+            "author_overlap_weight": 0,
+            "category_preference_weight": 0,
         }
         source.update(arxiv)
-        retriever = ArxivRetriever(
+        return ArxivRetriever(
             {
                 "executor": {"business_date": "2026-04-22", "timezone": "UTC"},
                 "source": {"arxiv": source},
             }
         )
-        retriever._semantic_inputs = []
 
-        def _semantic(papers: list[RawPaper]) -> dict[str, float]:
-            retriever._semantic_inputs.append([str(paper["entry_id"]) for paper in papers])
-            return {}
-
-        retriever._semantic_scores = _semantic  # type: ignore[method-assign]
-        return retriever
-
-    def test_embeddings_run_only_for_the_cheap_top_slice(self):
+    def test_prefilter_keeps_the_configured_top_slice(self):
         retriever = self._retriever()
         papers = [
             _raw_paper(
@@ -1000,22 +993,15 @@ class SemanticPrefilterTests(unittest.TestCase):
             papers, ["alpha", "beta", "gamma", "delta", "epsilon"]
         )
 
-        self.assertEqual(retriever._semantic_inputs, [["p1", "p2"]])
-        self.assertEqual(
-            [paper["entry_id"] for paper in ranked],
-            ["p1", "p2", "p3", "p4"],
-        )
+        self.assertEqual([paper["entry_id"] for paper in ranked], ["p1", "p2"])
         self.assertEqual(retriever._last_rank_stats["candidate_count"], 4)
-        self.assertEqual(retriever._last_rank_stats["semantic_input_count"], 2)
+        self.assertEqual(retriever._last_rank_stats["prefilter_count"], 2)
         self.assertEqual(retriever._last_rank_stats["held_back_count"], 2)
-        self.assertEqual(retriever._last_rank_stats["tail_kept"], 2)
+        self.assertEqual(retriever._last_rank_stats["backfilled"], 0)
+        self.assertIsNotNone(ranked[0].get("bm25_score"))
 
-    def test_pre_rerank_limit_stays_in_place_after_prefilter(self):
-        retriever = self._retriever(
-            semantic_prefilter_limit=2,
-            pre_rerank_limit=2,
-            keyword_fallback_min_results=2,
-        )
+    def test_prefilter_limit_prefers_newer_equal_matches(self):
+        retriever = self._retriever(llm_prefilter_limit=2)
         papers = [
             _raw_paper(
                 entry_id=f"p{day}",
@@ -1029,8 +1015,90 @@ class SemanticPrefilterTests(unittest.TestCase):
         ranked = retriever._rank_candidate_pool(papers, ["alpha"])
 
         self.assertEqual([paper["entry_id"] for paper in ranked], ["p22", "p21"])
-        self.assertEqual(retriever._semantic_inputs, [["p22", "p21"]])
         self.assertEqual(retriever._last_rank_stats["final_count"], 2)
+
+    def test_author_overlap_breaks_lexical_ties(self):
+        retriever = self._retriever(author_overlap_weight=0.6, llm_prefilter_limit=2)
+        retriever._corpus = [
+            CorpusPaper(
+                title="Library paper",
+                abstract="humanoid locomotion",
+                added_date=datetime(2026, 4, 1),
+                authors=["Xue Bin Peng"],
+            )
+        ]
+        papers = [
+            _raw_paper(
+                entry_id="other",
+                title="alpha beta",
+                summary="robot",
+                authors=["Ada Lovelace"],
+                published="2026-04-22T12:00:00+00:00",
+                primary_category="cs.CL",
+            ),
+            _raw_paper(
+                entry_id="overlap",
+                title="alpha beta",
+                summary="robot",
+                authors=["Ann Peng"],
+                published="2026-04-22T12:00:00+00:00",
+                primary_category="cs.CL",
+            ),
+        ]
+
+        ranked = retriever._rank_candidate_pool(papers, ["alpha", "beta"])
+
+        self.assertEqual([paper["entry_id"] for paper in ranked], ["overlap", "other"])
+
+    def test_category_preference_breaks_lexical_ties(self):
+        retriever = self._retriever(category_preference_weight=0.8, llm_prefilter_limit=2)
+        retriever._corpus = [
+            CorpusPaper(
+                title="Humanoid locomotion",
+                abstract="A quadruped studies locomotion and manipulation.",
+                added_date=datetime(2026, 4, 1),
+            )
+        ]
+        papers = [
+            _raw_paper(
+                entry_id="language",
+                title="alpha beta",
+                summary="robot",
+                published="2026-04-22T12:00:00+00:00",
+                primary_category="cs.CL",
+                categories=["cs.CL"],
+            ),
+            _raw_paper(
+                entry_id="robot",
+                title="alpha beta",
+                summary="robot",
+                published="2026-04-22T12:00:00+00:00",
+                primary_category="cs.RO",
+                categories=["cs.RO"],
+            ),
+        ]
+
+        ranked = retriever._rank_candidate_pool(papers, ["alpha", "beta"])
+
+        self.assertEqual([paper["entry_id"] for paper in ranked], ["robot", "language"])
+
+    def test_unmatched_pool_backfills_by_bm25_up_to_the_limit(self):
+        retriever = self._retriever(llm_prefilter_limit=2, use_bm25_scoring=True)
+        papers = [
+            _raw_paper(
+                entry_id=f"p{day}",
+                title="unrelated",
+                summary="nothing",
+                published=f"2026-04-{day:02d}T12:00:00+00:00",
+            )
+            for day in (19, 20, 21, 22)
+        ]
+
+        ranked = retriever._rank_candidate_pool(papers, ["alpha"])
+
+        self.assertEqual([paper["entry_id"] for paper in ranked], ["p22", "p21"])
+        self.assertEqual(retriever._last_rank_stats["matched_before_backfill"], 0)
+        self.assertEqual(retriever._last_rank_stats["backfilled"], 2)
 
 
 class LocalKeywordExtractionTests(unittest.TestCase):

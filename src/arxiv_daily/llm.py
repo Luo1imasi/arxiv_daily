@@ -22,10 +22,11 @@ from .utils import retry_call
 
 PROMPT_VERSIONS = {
     "extract": "keywords-v2",
-    "summarize": "tldr-v2",
+    "summarize": "tldr-v3",
     "judge": "judge-v1",
     "profile": "profile-v1",
     "qa": "qa-v1",
+    "coarse": "coarse-v1",
 }
 
 _client_cache: dict[tuple[Any, ...], OpenAI] = {}
@@ -59,12 +60,20 @@ class LLMCallError(Exception):
 
 
 @dataclass
+class ModelUsage:
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    api_requests: int = 0
+
+
+@dataclass
 class LLMUsage:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     api_requests: int = 0
     error_count: int = 0
     warnings: list[str] = field(default_factory=list)
+    by_model: dict[str, ModelUsage] = field(default_factory=dict)
 
 
 _usage = LLMUsage()
@@ -95,29 +104,50 @@ def note_llm_warning(message: str) -> None:
 
 def get_llm_usage() -> dict[str, Any]:
     with _usage_lock:
+        by_model = {
+            model: {
+                "api_requests": int(bucket.api_requests),
+                "prompt_tokens": int(bucket.prompt_tokens),
+                "completion_tokens": int(bucket.completion_tokens),
+            }
+            for model, bucket in _usage.by_model.items()
+        }
         return {
             "llm_prompt_tokens": int(_usage.prompt_tokens),
             "llm_completion_tokens": int(_usage.completion_tokens),
             "llm_api_requests": int(_usage.api_requests),
             "llm_error_count": int(_usage.error_count),
             "llm_warning": "；".join(_usage.warnings),
+            "llm_usage_by_model": by_model,
         }
 
 
-def _record_usage(prompt_tokens: int, completion_tokens: int) -> None:
+def _record_usage(prompt_tokens: int, completion_tokens: int, model: str = "") -> None:
+    prompt = max(0, int(prompt_tokens or 0))
+    completion = max(0, int(completion_tokens or 0))
     with _usage_lock:
         _usage.api_requests += 1
-        _usage.prompt_tokens += max(0, int(prompt_tokens or 0))
-        _usage.completion_tokens += max(0, int(completion_tokens or 0))
+        _usage.prompt_tokens += prompt
+        _usage.completion_tokens += completion
+        name = str(model or "").strip()
+        if not name:
+            return
+        bucket = _usage.by_model.setdefault(name, ModelUsage())
+        bucket.api_requests += 1
+        bucket.prompt_tokens += prompt
+        bucket.completion_tokens += completion
 
 
 def resolve_model(config: dict[str, Any], role: str) -> str:
-    model_role = {"profile": "judge", "qa": "summarize"}.get(role, role)
     models = get_config_value(config, "llm.models", {}) or {}
+    aliases = {"profile": "judge", "qa": "summarize"}
     if isinstance(models, dict):
-        configured = models.get(model_role) or models.get(role)
+        configured = models.get(role)
         if configured:
             return str(configured)
+        alias = aliases.get(role)
+        if alias and models.get(alias):
+            return str(models[alias])
     return str(get_config_value(config, "llm.model"))
 
 
@@ -391,6 +421,7 @@ def _call_llm_api(
     _record_usage(
         int(getattr(usage, "prompt_tokens", 0) or 0),
         int(getattr(usage, "completion_tokens", 0) or 0),
+        model,
     )
     choices = getattr(response, "choices", None) or []
     if not choices:
@@ -660,7 +691,7 @@ def build_interest_profile(
     )
     parsed = _call_json(
         config,
-        role="judge",
+        role="profile",
         system="你维护一位研究者的兴趣画像，只返回 JSON。",
         user=prompt,
         max_tokens=1800,
@@ -784,8 +815,9 @@ def _tldr_prompt(
         _string_list(profile.get("topics"), 6)
     )
     return (
-        f"为下面每一篇论文写结构化中文短评。语言：{language}。\n"
-        "每篇都要有 tldr、method、evidence、why_for_me，各用一句，大约 40 到 80 个汉字。\n"
+        f"为下面每一篇论文写结构化短评。语言：{language}。\n"
+        "每篇只写 tldr、method、evidence、why_for_me 四个短句，每句不超过 40 个汉字。\n"
+        "不要分析过程，不要复述标题，不要补充摘要里没有的数字。\n"
         f"读者兴趣：{interest or '未提供'}\n\n"
         + "\n\n".join(blocks)
         + '\n\n只返回 JSON：{"items":[{"id":"","tldr":"","method":"","evidence":"","why_for_me":""}]}'
@@ -821,8 +853,10 @@ def _collect_tldr_items(parsed: dict[str, Any] | None) -> dict[str, dict[str, st
 
 
 def _tldr_max_tokens(paper_count: int) -> int:
-    # A 10-paper batch at 2800 tokens stopped inside the reasoning trace.
-    return min(12000, 1200 + 700 * max(1, paper_count))
+    # grok-4.5 spends completion budget on a reasoning trace before the JSON.
+    # Keep enough room for 10 short items, and stop well below the old ceiling
+    # that let traces run on for thousands of tokens.
+    return min(4500, 700 + 280 * max(1, paper_count))
 
 
 def _request_tldr_items(

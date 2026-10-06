@@ -15,7 +15,7 @@ from typing import Any
 from .protocol import CorpusPaper, Paper
 from .webdav import fetch_corpus
 from .retriever import get_retriever_cls
-from .reranker import get_reranker_cls
+from .coarse import coarse_pool_size, diverse_shortlist, order_by_bm25, score_coarse_papers
 from .llm import (
     PROMPT_VERSIONS,
     build_interest_profile,
@@ -81,8 +81,12 @@ def _default_llm_metrics(*, enabled: bool, target_count: int = 0) -> dict[str, o
         "tldr_request_count": 0,
         "judge_cache_hits": 0,
         "judge_request_count": 0,
+        "coarse_cache_hits": 0,
+        "coarse_request_count": 0,
+        "coarse_fallback": False,
         "llm_prompt_tokens": 0,
         "llm_completion_tokens": 0,
+        "llm_usage_by_model": {},
         "llm_warning": "",
     }
 
@@ -92,6 +96,7 @@ def _merge_llm_usage(metrics: dict[str, object]) -> None:
     metrics["llm_error_count"] = usage["llm_error_count"]
     metrics["llm_prompt_tokens"] = usage["llm_prompt_tokens"]
     metrics["llm_completion_tokens"] = usage["llm_completion_tokens"]
+    metrics["llm_usage_by_model"] = usage.get("llm_usage_by_model") or {}
     metrics["llm_warning"] = usage["llm_warning"]
     metrics["llm_request_count"] = usage["llm_api_requests"]
 
@@ -269,7 +274,7 @@ async def _apply_judge(
             lambda: judge_papers(pending, profile, config),
         )
         if not judgments:
-            logger.warning("Judge failed; keeping MMR order")
+            logger.warning("Judge failed; keeping coarse order")
             chosen = papers[:max_num]
         else:
             _attach_judgments(pending, judgments)
@@ -293,6 +298,71 @@ async def _apply_judge(
             }
         )
     await db.save_candidate_enrichments(entries)
+    return chosen
+
+
+async def _apply_coarse(
+    papers: list[Paper],
+    profile: dict[str, Any] | None,
+    config: dict[str, Any],
+    metrics: dict[str, object],
+) -> list[Paper]:
+    shortlist_limit = coarse_pool_size(config)
+    cache_key = _get_llm_cache_key(config, "coarse")
+    cached_enrichments = await db.load_candidate_enrichments(
+        [paper.url for paper in papers if paper.url]
+    )
+    pending: list[Paper] = []
+    cached_scores: dict[str, float] = {}
+    for paper in papers:
+        cached = cached_enrichments.get(paper.url or "")
+        score = cached.get("coarse_score") if cached else None
+        if (
+            cached
+            and cached.get("content_key") == _content_key(paper)
+            and cached.get("coarse_cache_key") == cache_key
+            and score is not None
+        ):
+            cached_scores[paper.url] = float(score)
+        else:
+            pending.append(paper)
+    metrics["coarse_cache_hits"] = len(cached_scores)
+    fresh: dict[str, float] | None = {}
+    requests = 0
+    if pending:
+        loop = asyncio.get_running_loop()
+        outcome = await loop.run_in_executor(
+            get_executor_pool(config),
+            lambda: score_coarse_papers(pending, profile, config),
+        )
+        requests = outcome.requests
+        fresh = outcome.scores
+    metrics["coarse_request_count"] = requests
+    if fresh is None:
+        metrics["coarse_fallback"] = True
+        logger.warning("LLM coarse screening failed; using BM25 order")
+        return order_by_bm25(papers, shortlist_limit)
+    metrics["coarse_fallback"] = False
+    scores = dict(cached_scores)
+    scores.update(fresh or {})
+    chosen = diverse_shortlist(papers, scores, config)
+    entries = []
+    for paper in pending:
+        if not paper.url or paper.url not in (fresh or {}):
+            continue
+        entries.append(
+            {
+                "url": paper.url,
+                "pdf_url": paper.pdf_url,
+                "content_key": _content_key(paper),
+                "coarse_score": fresh[paper.url],
+                "coarse_cache_key": cache_key,
+            }
+        )
+    await db.save_candidate_enrichments(entries)
+    metrics["coarse_shortlist"] = [
+        {"url": paper.url, "title": paper.title, "score": paper.score} for paper in chosen
+    ]
     return chosen
 
 
@@ -677,20 +747,23 @@ class Executor:
 
         logger.info(f"Total {len(all_papers)} papers from all sources")
 
-        logger.info("Reranking with local reranker...")
-        reranker = get_reranker_cls("local")(self.config)
-        stage_started = time.perf_counter()
-        reranked = await loop.run_in_executor(
-            get_executor_pool(self.config), lambda: reranker.rerank(all_papers, corpus)
-        )
-        _finish_stage("rerank", stage_started)
-        self.last_run_metrics["reranked_candidates"] = len(reranked)
         max_num = int(get_config_value(self.config, "executor.max_paper_num"))
-
+        stage_started = time.perf_counter()
         if use_llm and llm_ready:
             self.last_run_metrics.update(
-                _default_llm_metrics(enabled=True, target_count=min(len(reranked), max_num))
+                _default_llm_metrics(enabled=True, target_count=max_num)
             )
+            logger.info(f"Coarse-screening {len(all_papers)} prefiltered papers")
+            reranked = await _apply_coarse(
+                all_papers, profile, self.config, self.last_run_metrics
+            )
+        else:
+            reranked = order_by_bm25(all_papers, max_num)
+        _finish_stage("coarse", stage_started)
+        self.last_run_metrics["reranked_candidates"] = len(reranked)
+        self.last_run_metrics["coarse_candidates"] = len(reranked)
+
+        if use_llm and llm_ready:
             stage_started = time.perf_counter()
             reranked = await _apply_judge(
                 reranked, profile, self.config, self.last_run_metrics
@@ -728,6 +801,9 @@ class Executor:
                 "extract": resolve_model(self.config, "extract"),
                 "summarize": resolve_model(self.config, "summarize"),
                 "judge": resolve_model(self.config, "judge"),
+                "profile": resolve_model(self.config, "profile"),
+                "qa": resolve_model(self.config, "qa"),
+                "coarse": resolve_model(self.config, "coarse"),
             }
             _merge_llm_usage(self.last_run_metrics)
 

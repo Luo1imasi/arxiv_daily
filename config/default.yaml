@@ -21,6 +21,9 @@ source:
     keyword_query_max_results: 80
     semantic_mix: 0.45
     semantic_prefilter_limit: 300
+    llm_prefilter_limit: 200
+    author_overlap_weight: 0.6
+    category_preference_weight: 0.8
     pre_rerank_limit: 120
     use_bm25_scoring: true
     min_keyword_matches: 1
@@ -38,11 +41,19 @@ llm:
     extract: "gpt-4o-mini"
     summarize: "gpt-4o-mini"
     judge: "gpt-4o-mini"
+    profile: "gpt-4o-mini"
+    qa: "gpt-4o-mini"
+    coarse: "gpt-4o-mini"
   language: "Chinese"
   timeout: 180.0
   max_retries: 3
   base_delay: 1.0
   max_concurrent_requests: 2
+  coarse_batch_size: 40
+  coarse_concurrency: 2
+  coarse_abstract_chars: 280
+  coarse_max_tokens: 2200
+  coarse_duplicate_jaccard: 0.8
 
 reranker:
   model: "jinaai/jina-embeddings-v5-text-nano"

@@ -671,7 +671,7 @@
             const models = cfg.llm?.models || {};
             const hint = document.getElementById('cfg_llm_models_hint');
             if (hint) {
-                hint.textContent = `抽取 ${models.extract || cfg.llm?.model || '-'} · 摘要 ${models.summarize || cfg.llm?.model || '-'} · 裁判 ${models.judge || cfg.llm?.model || '-'}`;
+                hint.textContent = `抽取 ${models.extract || cfg.llm?.model || '-'} · 粗筛 ${models.coarse || cfg.llm?.model || '-'} · 摘要 ${models.summarize || cfg.llm?.model || '-'} · 裁判 ${models.judge || cfg.llm?.model || '-'}`;
             }
             document.getElementById('cfg_schedule_hour').value = cfg.executor?.schedule_hour ?? 8;
             document.getElementById('cfg_schedule_minute').value = cfg.executor?.schedule_minute ?? 0;

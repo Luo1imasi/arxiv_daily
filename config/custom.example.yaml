@@ -9,6 +9,7 @@ source:
   arxiv:
     use_keyword_search: true
     max_keywords: 15
+    llm_prefilter_limit: 200
     recent_days: 7
     max_recent_days: 30
     recency_half_life_days: 7
@@ -16,13 +17,21 @@ source:
 
 llm:
   api_key: ""
-  base_url: "https://api.openai.com/v1"
-  model: "deepseek-flash"
+  base_url: "http://127.0.0.1:8080/v1"
+  model: "grok-4.5"
   models:
-    extract: "deepseek-flash"
-    summarize: "glm-5.3-flash"
+    extract: "grok-4.5"
+    coarse: "grok-4.3"
+    summarize: "grok-4.5"
     judge: "grok-4.7"
+    profile: "grok-4.7"
+    qa: "grok-4.5"
   language: "Chinese"
+  max_concurrent_requests: 2
+  coarse_batch_size: 40
+  coarse_concurrency: 2
+  coarse_abstract_chars: 280
+  coarse_max_tokens: 2200
 
 reranker:
   mmr_lambda: 0.78

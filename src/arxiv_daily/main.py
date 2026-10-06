@@ -98,8 +98,11 @@ def public_config(config: dict[str, Any]) -> dict[str, Any]:
             "model": llm_config.get("model"),
             "models": {
                 "extract": models.get("extract"),
+                "coarse": models.get("coarse"),
                 "summarize": models.get("summarize"),
                 "judge": models.get("judge"),
+                "profile": models.get("profile"),
+                "qa": models.get("qa"),
             },
             "configured": bool(llm_config.get("api_key")),
         },
@@ -564,9 +567,9 @@ async def ask_question(request: Request):
 
     import asyncio
 
+    from .lexical import rank_items_by_query
     from .llm import answer_question as generate_answer
     from .llm import reset_llm_usage
-    from .reranker.local import rank_items_by_query
 
     today = _current_business_date(_app_config)
     papers = await db.get_papers_between((today - timedelta(days=21)).isoformat(), today.isoformat())
@@ -598,7 +601,7 @@ async def ask_question(request: Request):
         )
     loop = asyncio.get_running_loop()
     ranked = await loop.run_in_executor(
-        None, lambda: rank_items_by_query(_app_config, question, items, top_k=8)
+        None, lambda: rank_items_by_query(question, items, top_k=8)
     )
     contexts = []
     for index, score in ranked:

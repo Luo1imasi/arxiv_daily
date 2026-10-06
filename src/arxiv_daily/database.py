@@ -108,6 +108,8 @@ _INIT_DB_SQL = """
         judge_keep INTEGER,
         llm_cache_key TEXT,
         judge_cache_key TEXT,
+        coarse_score REAL,
+        coarse_cache_key TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
     );
@@ -274,6 +276,8 @@ async def _ensure_cache_columns(db: aiosqlite.Connection):
         ("candidate_enrichment_cache", "judge_reason", "TEXT"),
         ("candidate_enrichment_cache", "judge_keep", "INTEGER"),
         ("candidate_enrichment_cache", "judge_cache_key", "TEXT"),
+        ("candidate_enrichment_cache", "coarse_score", "REAL"),
+        ("candidate_enrichment_cache", "coarse_cache_key", "TEXT"),
         ("corpus_cache", "source_path", "TEXT"),
     ):
         if not await _column_exists(db, table, column):
@@ -661,6 +665,8 @@ async def save_candidate_enrichments(
                     _field(entry, previous, "judge_keep"),
                     _field(entry, previous, "llm_cache_key"),
                     _field(entry, previous, "judge_cache_key"),
+                    _field(entry, previous, "coarse_score"),
+                    _field(entry, previous, "coarse_cache_key"),
                     created_at,
                     now_iso,
                 )
@@ -670,8 +676,8 @@ async def save_candidate_enrichments(
             """INSERT OR REPLACE INTO candidate_enrichment_cache
                (url, pdf_url, content_key, tldr, method, evidence, why_for_me,
                 judge_relevance, judge_reason, judge_keep, llm_cache_key, judge_cache_key,
-                created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                coarse_score, coarse_cache_key, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             payload,
         )
         await db.commit()

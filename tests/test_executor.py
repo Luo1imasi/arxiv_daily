@@ -57,8 +57,12 @@ class DefaultLlmMetricsTests(unittest.TestCase):
                 "tldr_request_count": 0,
                 "judge_cache_hits": 0,
                 "judge_request_count": 0,
+                "coarse_cache_hits": 0,
+                "coarse_request_count": 0,
+                "coarse_fallback": False,
                 "llm_prompt_tokens": 0,
                 "llm_completion_tokens": 0,
+                "llm_usage_by_model": {},
                 "llm_warning": "",
             },
         )
@@ -446,7 +450,7 @@ class CandidateEnrichmentCacheTests(unittest.IsolatedAsyncioTestCase):
                 generate_again.assert_not_called()
                 self.assertEqual(fresh.tldr, "中文总结")
                 self.assertEqual(hit_metrics["tldr_cache_hits"], 1)
-                self.assertIn("tldr-v2", str(make_llm_cache_key(config, "summarize")))
+                self.assertIn("tldr-v3", str(make_llm_cache_key(config, "summarize")))
             finally:
                 if old_data_dir is None:
                     os.environ.pop("ARXIV_DAILY_DATA", None)

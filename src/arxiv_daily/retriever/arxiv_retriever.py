@@ -17,6 +17,12 @@ from tqdm import tqdm
 from .base import BaseRetriever, register_retriever
 from ..protocol import Paper, CorpusPaper
 from ..config import get_config_value
+from ..lexical import (
+    author_overlap_bonus,
+    category_preference_bonus,
+    category_weights_from_corpus,
+    corpus_author_surnames,
+)
 from .. import database as db
 from ..business_date import business_window_utc as _business_window_utc
 from ..business_date import get_business_date as _business_date
@@ -463,10 +469,12 @@ def _paper_with_scores(
     paper: RawPaper,
     retrieval_score: float,
     lookback_score: float,
+    bm25_score: float = 0.0,
 ) -> RawPaper:
     snapshot = dict(paper)
     snapshot["retrieval_score"] = float(retrieval_score)
     snapshot["lookback_score"] = float(lookback_score)
+    snapshot["bm25_score"] = float(bm25_score)
     return snapshot
 
 
@@ -676,6 +684,8 @@ class ArxivRetriever(BaseRetriever):
         self._rank_seconds = 0.0
         self._semantic_seconds = 0.0
         self._last_rank_stats: dict[str, int] = {}
+        self._author_surnames_cache: set[str] | None = None
+        self._category_weights_cache: dict[str, float] | None = None
 
     def _publish_retrieval_stats(self, export_calls: int) -> None:
         rank_stats = dict(self._last_rank_stats)
@@ -1188,24 +1198,16 @@ class ArxivRetriever(BaseRetriever):
 
         return _run_arxiv_call(_fetch, description="search")
 
-    def _semantic_scores(self, papers: list[RawPaper]) -> dict[str, float]:
-        if not papers or not self._corpus:
-            return {}
-        try:
-            from ..reranker.local import semantic_scores_for_raw_papers
+    def _library_author_surnames(self) -> set[str]:
+        if self._author_surnames_cache is None:
+            self._author_surnames_cache = corpus_author_surnames(self._corpus)
+            logger.info(f"Library author surnames: {len(self._author_surnames_cache)}")
+        return self._author_surnames_cache
 
-            profile = self.config.get("interest_profile") or {}
-            query = ""
-            if isinstance(profile, dict):
-                query = str(profile.get("summary") or "")
-                if not query:
-                    query = " ".join(str(item) for item in (profile.get("topics") or []))
-            return semantic_scores_for_raw_papers(
-                self.config, papers, self._corpus, query or None
-            )
-        except Exception as exc:
-            logger.warning(f"Semantic coarse ranking skipped: {exc}")
-            return {}
+    def _library_category_weights(self) -> dict[str, float]:
+        if self._category_weights_cache is None:
+            self._category_weights_cache = category_weights_from_corpus(self._corpus)
+        return self._category_weights_cache
 
     def _rank_candidate_pool(
         self, papers: list[RawPaper], keywords: list[str]
@@ -1222,10 +1224,12 @@ class ArxivRetriever(BaseRetriever):
         if not keywords or not papers:
             self._last_rank_stats = {
                 "candidate_count": len(papers),
+                "prefilter_count": 0,
                 "semantic_input_count": 0,
                 "held_back_count": len(papers),
                 "matched_before_backfill": 0,
                 "backfilled": 0,
+                "tail_kept": 0,
                 "final_count": 0,
             }
             return []
@@ -1239,11 +1243,13 @@ class ArxivRetriever(BaseRetriever):
         use_bm25 = bool(get_config_value(self.config, "source.arxiv.use_bm25_scoring"))
         bm25_scores = _compute_bm25_scores(papers, keywords) if use_bm25 else {}
         bm25_scores = _normalize_scores(bm25_scores)
-        semantic_mix = float(get_config_value(self.config, "source.arxiv.semantic_mix", 0.45))
-        fallback_target = max(self.keyword_fallback_min_results, self.pre_rerank_limit)
-        prefilter_limit = int(
-            get_config_value(self.config, "source.arxiv.semantic_prefilter_limit", 300)
+        prefilter_limit = int(get_config_value(self.config, "source.arxiv.llm_prefilter_limit", 200))
+        author_weight = float(get_config_value(self.config, "source.arxiv.author_overlap_weight", 0.6))
+        category_scale = float(
+            get_config_value(self.config, "source.arxiv.category_preference_weight", 0.8)
         )
+        library_surnames = self._library_author_surnames() if author_weight > 0 else set()
+        category_weights = self._library_category_weights() if category_scale > 0 else {}
 
         def _recency_bonus(published: datetime | None) -> float:
             if published is None:
@@ -1259,7 +1265,7 @@ class ArxivRetriever(BaseRetriever):
             )
             return float(math.exp(-age_days / self.recency_half_life_days))
 
-        # hybrid, match, bm25, match_count, recency, text_score, negative_penalty, paper
+        # hybrid, lexical_hybrid, match, bm25, match_count, recency, retrieval, paper
         cheap_rows: list[tuple[float, float, float, float, float, float, float, RawPaper]] = []
         for paper in papers:
             match_score, match_count = _compute_keyword_match_score(paper, keywords)
@@ -1274,92 +1280,66 @@ class ArxivRetriever(BaseRetriever):
             negative_penalty = (
                 min(negative_score, 4.0) if negative_count and match_count == 0 else 0.0
             )
-            cheap_hybrid = text_score - negative_penalty + recency_bonus * 0.75
+            overlap_bonus = author_overlap_bonus(
+                _raw_paper_authors(paper), library_surnames, author_weight
+            )
+            category_bonus = category_preference_bonus(
+                _raw_paper_primary_category(paper),
+                _raw_paper_categories(paper),
+                category_weights,
+                category_scale,
+            )
+            retrieval_score = text_score - negative_penalty
+            lexical_hybrid = retrieval_score + recency_bonus * 0.75
+            hybrid_score = lexical_hybrid + overlap_bonus + category_bonus
             cheap_rows.append(
                 (
-                    cheap_hybrid,
+                    hybrid_score,
+                    lexical_hybrid,
                     match_score,
                     bm25_score,
                     match_count,
                     recency_bonus,
-                    text_score,
-                    negative_penalty,
+                    retrieval_score,
                     paper,
                 )
             )
-        cheap_rows.sort(key=lambda row: (-row[0], -row[1], -row[2], -row[3]))
+        cheap_rows.sort(key=lambda row: (-row[0], -row[2], -row[3], -row[4]))
 
-        selected_rows: list[tuple[float, float, float, float, float, float, float, RawPaper]] = []
-        seen_cheap: set[str] = set()
         limit = len(cheap_rows) if prefilter_limit <= 0 else prefilter_limit
-        for row in cheap_rows:
-            paper_id = _paper_entry_id(row[-1])
-            if paper_id in seen_cheap:
-                continue
-            seen_cheap.add(paper_id)
-            selected_rows.append(row)
-            if len(selected_rows) >= limit:
-                break
-        selected_papers = [row[-1] for row in selected_rows]
-        logger.info(
-            f"Cheap prefilter selected {len(selected_papers)} of {len(papers)} candidates "
-            f"for embeddings (limit={prefilter_limit})"
-        )
-
-        semantic_started = time_module.perf_counter()
-        semantic_scores = self._semantic_scores(selected_papers)
-        self._semantic_seconds += time_module.perf_counter() - semantic_started
-        semantic_values = list(semantic_scores.values())
-        semantic_min = min(semantic_values) if semantic_values else 0.0
-        semantic_max = max(semantic_values) if semantic_values else 0.0
-
-        def _semantic_norm(paper_id: str) -> float:
-            if not semantic_scores or semantic_max <= semantic_min:
-                return 0.0
-            return (semantic_scores.get(paper_id, semantic_min) - semantic_min) / (
-                semantic_max - semantic_min
-            )
-
         scored_papers: list[tuple[float, float, float, float, float, RawPaper]] = []
         seen_ids: set[str] = set()
         for (
-            _cheap_hybrid,
+            hybrid_score,
+            lexical_hybrid,
             match_score,
             bm25_score,
             match_count,
             recency_bonus,
-            text_score,
-            negative_penalty,
+            retrieval_score,
             paper,
-        ) in selected_rows:
+        ) in cheap_rows:
+            if not (match_count >= min_match_count or lexical_hybrid >= 1.5):
+                continue
             paper_id = _paper_entry_id(paper)
-            semantic_norm = _semantic_norm(paper_id)
-            if semantic_scores:
-                retrieval_score = (1.0 - semantic_mix) * text_score + semantic_mix * (
-                    semantic_norm * 4.0
-                )
-            else:
-                retrieval_score = text_score
-            retrieval_score -= negative_penalty
-            hybrid_score = retrieval_score + recency_bonus * 0.75
+            if paper_id in seen_ids:
+                continue
+            seen_ids.add(paper_id)
             lookback_score = hybrid_score * (1.0 + min(match_count, 3.0))
-            if match_count >= min_match_count or hybrid_score >= 1.5 or semantic_norm >= 0.72:
-                if paper_id not in seen_ids:
-                    seen_ids.add(paper_id)
-                    scored_papers.append(
-                        (
-                            hybrid_score,
-                            match_score,
-                            bm25_score,
-                            match_count,
-                            recency_bonus,
-                            _paper_with_scores(paper, retrieval_score, lookback_score),
-                        )
-                    )
+            scored_papers.append(
+                (
+                    hybrid_score,
+                    match_score,
+                    bm25_score,
+                    match_count,
+                    recency_bonus,
+                    _paper_with_scores(paper, retrieval_score, lookback_score, bm25_score),
+                )
+            )
+            if len(scored_papers) >= limit:
+                break
 
-        scored_papers.sort(key=lambda x: (-x[0], -x[1], -x[2], -x[3]))
-
-        matched_papers = [p for *_, p in scored_papers]
+        matched_papers = [paper for *_, paper in scored_papers]
         matched_before_backfill = len(matched_papers)
 
         fallback_scored: list[tuple[float, float, float, RawPaper]] = []
@@ -1374,20 +1354,17 @@ class ArxivRetriever(BaseRetriever):
                     fallback_score,
                     bm25_score,
                     recency_bonus,
-                    _paper_with_scores(paper, retrieval_score, lookback_score),
+                    _paper_with_scores(paper, retrieval_score, lookback_score, bm25_score),
                 )
             )
-
         fallback_scored.sort(key=lambda item: (-item[0], -item[1], -item[2]))
 
         backfilled_count = 0
-        if not matched_papers:
-            logger.warning(
-                "Keyword ranking yielded no matches, falling back to BM25/recency ranking"
-            )
-            matched_papers = [paper for *_, paper in fallback_scored[:fallback_target]]
-            backfilled_count = len(matched_papers)
-        elif len(matched_papers) < fallback_target:
+        if len(matched_papers) < limit:
+            if not matched_papers:
+                logger.warning(
+                    "Keyword ranking yielded no matches, falling back to BM25/recency ranking"
+                )
             existing_ids = {_paper_entry_id(paper) for paper in matched_papers}
             backfilled = list(matched_papers)
             for _, _, _, paper in fallback_scored:
@@ -1396,41 +1373,35 @@ class ArxivRetriever(BaseRetriever):
                     continue
                 existing_ids.add(paper_id)
                 backfilled.append(paper)
-                if len(backfilled) >= fallback_target:
+                if len(backfilled) >= limit:
                     break
             backfilled_count = len(backfilled) - len(matched_papers)
             if backfilled_count:
-                logger.info(
-                    f"Backfilled {backfilled_count} additional BM25/recency papers"
-                )
+                logger.info(f"Backfilled {backfilled_count} additional BM25/recency papers")
             matched_papers = backfilled
 
-        if len(matched_papers) > self.pre_rerank_limit > 0:
-            matched_papers = matched_papers[: self.pre_rerank_limit]
-
-        semantic_ids = {_paper_entry_id(paper) for paper in selected_papers}
-        tail_kept = sum(
-            1 for paper in matched_papers if _paper_entry_id(paper) not in semantic_ids
-        )
         self._last_rank_stats = {
             "candidate_count": len(papers),
-            "semantic_input_count": len(selected_papers),
-            "held_back_count": max(len(papers) - len(selected_papers), 0),
+            "prefilter_count": len(matched_papers),
+            "semantic_input_count": len(matched_papers),
+            "held_back_count": max(len(papers) - len(matched_papers), 0),
             "matched_before_backfill": matched_before_backfill,
             "backfilled": backfilled_count,
-            "tail_kept": tail_kept,
+            "tail_kept": backfilled_count,
             "final_count": len(matched_papers),
         }
         logger.info(
-            f"Found {len(matched_papers)} papers matching keywords "
-            f"(min_matches={min_match_count}, bm25={use_bm25}, "
-            f"semantic_pool={len(selected_papers)}, held_back={self._last_rank_stats['held_back_count']})"
+            f"Cheap prefilter kept {len(matched_papers)} of {len(papers)} candidates "
+            f"for LLM coarse ranking (limit={prefilter_limit}, "
+            f"min_matches={min_match_count}, bm25={use_bm25}, "
+            f"backfilled={backfilled_count})"
         )
         if matched_papers and logger.level("DEBUG").no >= logger.level("INFO").no:
             logger.info("Top matches:")
-            for i, (score, lexical, bm25, count, recency, paper) in enumerate(scored_papers[:5]):
+            for index, (score, lexical, bm25, count, recency, paper) in enumerate(scored_papers[:5]):
                 logger.info(
-                    f"  {i + 1}. [score={score:.2f}, lexical={lexical:.2f}, bm25={bm25:.2f}, matches={count:.1f}, recency={recency:.2f}] {_paper_title(paper)[:60]}..."
+                    f"  {index + 1}. [score={score:.2f}, lexical={lexical:.2f}, bm25={bm25:.2f}, "
+                    f"matches={count:.1f}, recency={recency:.2f}] {_paper_title(paper)[:60]}..."
                 )
 
         return matched_papers
@@ -1511,5 +1482,10 @@ class ArxivRetriever(BaseRetriever):
             pdf_url=pdf_url,
             code_url=code_url,
             retrieval_score=_raw_paper_float(retrieval_score) if retrieval_score is not None else None,
+            bm25_score=(
+                _raw_paper_float(raw_paper.get("bm25_score"))
+                if raw_paper.get("bm25_score") is not None
+                else None
+            ),
             date=published.strftime("%Y-%m-%d") if published else None,
         )

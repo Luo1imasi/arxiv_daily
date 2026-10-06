@@ -20,6 +20,7 @@ class Paper:
     judge_reason: str | None = None
     judge_keep: bool | None = None
     retrieval_score: float | None = None
+    bm25_score: float | None = None
     date: str | None = None
 
 
@@ -31,3 +32,4 @@ class CorpusPaper:
     file_path: str = ""
     source_path: str = ""
     paths: list[str] = field(default_factory=list)
+    authors: list[str] = field(default_factory=list)

@@ -9,9 +9,12 @@ from arxiv_daily.llm import (
     _create_completion,
     _extract_json_object,
     _extract_json_value,
+    _record_usage,
     generate_tldrs_batch,
+    get_llm_usage,
     make_llm_cache_key,
     message_text,
+    reset_llm_usage,
     resolve_model,
 )
 
@@ -117,13 +120,33 @@ class ModelRoutingTests(unittest.TestCase):
         judge_key = make_llm_cache_key(config, "judge")
 
         self.assertIn("deepseek-flash", summarize_key)
-        self.assertIn("tldr-v2", summarize_key)
+        self.assertIn("tldr-v3", summarize_key)
         self.assertIn("summarize", summarize_key)
         self.assertIn("grok-4.7", judge_key)
         self.assertIn("judge-v1", judge_key)
         self.assertNotEqual(summarize_key, judge_key)
         self.assertEqual(resolve_model(config, "profile"), "grok-4.7")
         self.assertEqual(resolve_model(config, "qa"), "deepseek-flash")
+        self.assertEqual(resolve_model(config, "coarse"), "fallback")
+        config["llm"]["models"]["coarse"] = "grok-4.3"
+        config["llm"]["models"]["profile"] = "grok-4.6"
+        self.assertEqual(resolve_model(config, "coarse"), "grok-4.3")
+        self.assertEqual(resolve_model(config, "profile"), "grok-4.6")
+
+
+class UsageAccountingTests(unittest.TestCase):
+    def test_usage_is_split_by_model(self):
+        reset_llm_usage()
+        _record_usage(3, 4, "grok-4.3")
+        _record_usage(5, 6, "grok-4.7")
+
+        usage = get_llm_usage()
+
+        self.assertEqual(usage["llm_prompt_tokens"], 8)
+        self.assertEqual(usage["llm_completion_tokens"], 10)
+        self.assertEqual(usage["llm_api_requests"], 2)
+        self.assertEqual(usage["llm_usage_by_model"]["grok-4.3"]["completion_tokens"], 4)
+        self.assertEqual(usage["llm_usage_by_model"]["grok-4.7"]["prompt_tokens"], 5)
 
 
 class CompletionRetryTests(unittest.TestCase):
@@ -347,8 +370,8 @@ class BatchTldrRetryTests(unittest.TestCase):
         from arxiv_daily.llm import _tldr_max_tokens
 
         self.assertLess(_tldr_max_tokens(1), _tldr_max_tokens(10))
-        self.assertGreaterEqual(_tldr_max_tokens(10), 8000)
-        self.assertLessEqual(_tldr_max_tokens(40), 12000)
+        self.assertEqual(_tldr_max_tokens(10), 3500)
+        self.assertEqual(_tldr_max_tokens(40), 4500)
 
     def test_single_paper_failure_is_not_retried_inside_batch(self):
         calls = {"count": 0}
