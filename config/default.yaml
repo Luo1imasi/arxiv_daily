@@ -33,6 +33,11 @@ source:
     recent_days: 14
     max_recent_days: 140
     recent_max_results: 2000
+    # Historical announcement backfill. One category query per subject, paged
+    # in small requests so a single call stays inside arXiv's polite limits.
+    announcement_page_size: 50
+    announcement_category_max_results: 100
+    announcement_max_attempts: 5
     recency_half_life_days: 14
     lookback_score_threshold: 7.0
 

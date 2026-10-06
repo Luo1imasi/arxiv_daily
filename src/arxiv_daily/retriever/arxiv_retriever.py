@@ -29,8 +29,10 @@ from ..lexical import (
     term_support_units,
 )
 from .. import database as db
+from ..business_date import announcement_window_utc as _announcement_window_utc
 from ..business_date import business_window_utc as _business_window_utc
 from ..business_date import get_business_date as _business_date
+from ..business_date import submitted_not_after_utc as _submitted_not_after_utc
 from ..utils import make_content_key
 
 RawPaper = dict[str, object]
@@ -177,8 +179,8 @@ def _arxiv_retry_after(exc: Exception) -> float | None:
         return None
 
 
-def _run_arxiv_call(func, *, description: str):
-    max_attempts = 3
+def _run_arxiv_call(func, *, description: str, max_attempts: int = 3):
+    max_attempts = max(1, int(max_attempts))
     last_exception: Exception | None = None
     for attempt in range(max_attempts):
         try:
@@ -724,6 +726,7 @@ class ArxivRetriever(BaseRetriever):
         self._rank_seconds = 0.0
         self._semantic_seconds = 0.0
         self._last_rank_stats: dict[str, int] = {}
+        self._announcement_meta: dict[str, object] = {}
         self._author_keys_cache: dict[str, int] | None = None
         self._category_weights_cache: dict[str, float] | None = None
 
@@ -744,6 +747,7 @@ class ArxivRetriever(BaseRetriever):
                 "term_query_count": self._term_query_count,
                 "lookback_rounds": self._lookback_rounds,
                 **rank_stats,
+                **self._announcement_meta,
             }
         )
 
@@ -781,6 +785,9 @@ class ArxivRetriever(BaseRetriever):
         export_started = _export_call_count
         self._reset_retrieval_counters()
         try:
+            if bool(self.executor_config.get("announcement_backfill")):
+                logger.info("Using announcement backfill mode")
+                return self._announcement_backfill_retrieval(categories)
             if self.use_keyword_search:
                 logger.info("Using keyword-based search mode")
                 return self._keyword_based_retrieval(categories)
@@ -1213,6 +1220,8 @@ class ArxivRetriever(BaseRetriever):
         categories: list[str],
         *,
         include_cross: bool,
+        page_size: int | None = None,
+        max_attempts: int | None = None,
     ) -> list[RawPaper]:
         if max_results <= 0:
             return []
@@ -1222,7 +1231,9 @@ class ArxivRetriever(BaseRetriever):
             sort_by=_ARXIV.SortCriterion.SubmittedDate,
             sort_order=_ARXIV.SortOrder.Descending,
         )
-        client = _ARXIV.Client(num_retries=2, delay_seconds=5, page_size=min(max_results, 200))
+        resolved_page = min(max_results, 200) if page_size is None else int(page_size)
+        resolved_page = max(1, min(resolved_page, max_results))
+        client = _ARXIV.Client(num_retries=2, delay_seconds=5, page_size=resolved_page)
 
         def _fetch() -> list[RawPaper]:
             found: list[RawPaper] = []
@@ -1245,7 +1256,197 @@ class ArxivRetriever(BaseRetriever):
                 found.append(raw_paper)
             return found
 
-        return _run_arxiv_call(_fetch, description="search")
+        return _run_arxiv_call(
+            _fetch,
+            description="search",
+            max_attempts=3 if max_attempts is None else max_attempts,
+        )
+
+    def _announcement_limits(self) -> tuple[int, int, int]:
+        page_size = int(get_config_value(self.config, "source.arxiv.announcement_page_size", 50))
+        per_category = int(
+            get_config_value(self.config, "source.arxiv.announcement_category_max_results", 100)
+        )
+        max_attempts = int(get_config_value(self.config, "source.arxiv.announcement_max_attempts", 5))
+        # arXiv asks for at least 3 seconds between requests. The shared slot
+        # wait is 5 seconds, and each page stays at or below 50 results.
+        page_size = max(1, min(page_size, 50))
+        per_category = max(1, min(per_category, 100))
+        return page_size, per_category, max(1, max_attempts)
+
+    def _announcement_cache_key(
+        self,
+        categories: list[str],
+        window_start: datetime,
+        window_end: datetime,
+    ) -> str:
+        payload = {
+            "mode": "announcement",
+            "categories": list(categories),
+            "include_cross_list": bool(get_config_value(self.config, "source.arxiv.include_cross_list")),
+            "business_date": self.business_date.isoformat(),
+            "window_start": window_start.astimezone(timezone.utc).strftime("%Y%m%d%H%M"),
+            "window_end": window_end.astimezone(timezone.utc).strftime("%Y%m%d%H%M"),
+            "query_terms": [term.lower() for term in self._active_terms],
+            "page_size": self._announcement_limits()[0],
+            "per_category": self._announcement_limits()[1],
+        }
+        return hashlib.sha1(repr(payload).encode("utf-8")).hexdigest()
+
+    def _paper_submitted_in_bounds(
+        self,
+        paper: RawPaper,
+        window_start: datetime,
+        window_end: datetime,
+        not_after: datetime,
+    ) -> bool:
+        published = _paper_published(paper)
+        if not _published_in_window(published, window_start, window_end):
+            return False
+        if published is None:
+            return False
+        published_utc = (
+            published.replace(tzinfo=timezone.utc)
+            if published.tzinfo is None
+            else published.astimezone(timezone.utc)
+        )
+        return published_utc < not_after
+
+    def _fetch_announcement_pool(
+        self,
+        categories: list[str],
+        window_start: datetime,
+        window_end: datetime,
+        not_after: datetime,
+    ) -> list[RawPaper]:
+        """One announcement batch: category listings plus profile term queries.
+
+        Requests stay sequential. The shared arXiv slot enforces the pause
+        between calls, 429/503 retry with exponential backoff, and each page
+        is capped by announcement_page_size.
+        """
+        page_size, per_category, max_attempts = self._announcement_limits()
+        include_cross = bool(get_config_value(self.config, "source.arxiv.include_cross_list"))
+        date_clause = (
+            f"submittedDate:[{_arxiv_date(window_start)} TO {_arxiv_date(window_end)}]"
+        )
+        papers: list[RawPaper] = []
+        failures: list[Exception] = []
+        for category in categories:
+            try:
+                papers.extend(
+                    self._search_arxiv(
+                        f"cat:{category} AND {date_clause}",
+                        per_category,
+                        window_start,
+                        window_end,
+                        categories,
+                        include_cross=include_cross,
+                        page_size=page_size,
+                        max_attempts=max_attempts,
+                    )
+                )
+            except Exception as exc:
+                failures.append(exc)
+                logger.warning(f"arXiv announcement query failed for {category}: {exc}")
+
+        term_queries = self._term_search_queries(self._active_terms)
+        self._term_query_count += len(term_queries)
+        per_query = min(
+            per_category,
+            int(get_config_value(self.config, "source.arxiv.keyword_query_max_results", 80)),
+        )
+        for term_query in term_queries:
+            try:
+                papers.extend(
+                    self._search_arxiv(
+                        f"{term_query} AND {date_clause}",
+                        per_query,
+                        window_start,
+                        window_end,
+                        categories,
+                        include_cross=include_cross,
+                        page_size=page_size,
+                        max_attempts=max_attempts,
+                    )
+                )
+            except Exception as exc:
+                failures.append(exc)
+                logger.warning(f"arXiv announcement term query failed: {exc}")
+
+        if not papers and failures:
+            raise failures[-1]
+        deduped = [
+            _to_raw_paper(paper)
+            for paper in _dedupe_arxiv_results(papers)
+            if self._paper_submitted_in_bounds(
+                _to_raw_paper(paper), window_start, window_end, not_after
+            )
+        ]
+        if bool(self.executor_config.get("debug", False)):
+            deduped = deduped[:20]
+        logger.info(
+            f"Fetched {len(deduped)} announcement papers "
+            f"({len(categories)} categories, {len(term_queries)} term queries)"
+        )
+        return deduped
+
+    def _announcement_backfill_retrieval(self, categories: list[str]) -> list[RawPaper]:
+        keywords: list[str] = []
+        if self._corpus:
+            keywords, negative_terms = asyncio.run(self._resolve_search_terms())
+            self._negative_terms = negative_terms
+        else:
+            logger.warning("No corpus for keyword extraction, using category retrieval")
+        self._active_terms = keywords
+        try:
+            window_start, window_end, kind, source_date = _announcement_window_utc(self.business_date)
+            not_after = _submitted_not_after_utc(self.config, self.business_date)
+            if window_end > not_after:
+                logger.info(
+                    f"Clipping announcement window end from {window_end.isoformat()} "
+                    f"to {not_after.isoformat()}"
+                )
+                window_end = not_after
+            self._announcement_meta = {
+                "announcement_kind": kind,
+                "announcement_source_date": source_date,
+                "announcement_window_start": window_start.isoformat(),
+                "announcement_window_end": window_end.isoformat(),
+            }
+            logger.info(
+                f"Announcement window for {self.business_date.isoformat()} "
+                f"({kind}, source {source_date}): "
+                f"{window_start.isoformat()} -> {window_end.isoformat()}"
+            )
+            cache_key = self._announcement_cache_key(categories, window_start, window_end)
+            cached_pool = asyncio.run(db.load_candidate_cache(cache_key))
+            if cached_pool:
+                logger.info(f"Using cached announcement pool: {len(cached_pool)} papers")
+                candidate_pool = [dict(paper) for paper in cached_pool]
+            else:
+                candidate_pool = self._fetch_announcement_pool(
+                    categories, window_start, window_end, not_after
+                )
+                if candidate_pool:
+                    asyncio.run(
+                        db.save_candidate_cache(
+                            cache_key,
+                            candidate_pool,
+                            ttl_minutes=self.candidate_cache_ttl_minutes,
+                        )
+                    )
+            if not candidate_pool:
+                logger.warning(
+                    f"No announcement papers for {self.business_date.isoformat()} ({kind})"
+                )
+                return []
+            if not keywords:
+                limit = int(get_config_value(self.config, "source.arxiv.broad_backfill_limit", 100))
+                return candidate_pool[:limit] if limit > 0 else candidate_pool
+            return self._rank_candidate_pool(candidate_pool, keywords)
+        finally:
+            self._active_terms = []
 
     def _library_author_keys(self) -> dict[str, int]:
         if self._author_keys_cache is None:

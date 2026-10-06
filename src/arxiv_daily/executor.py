@@ -35,6 +35,7 @@ from . import database as db
 from .config import get_config_value
 from .utils import make_content_key
 from .business_date import (
+    announcement_window_utc as _announcement_window_utc,
     business_date_range_between as _business_date_range_between,
     business_date_range_until as _business_date_range_until,
     config_for_business_date as _config_for_business_date,
@@ -494,14 +495,31 @@ def _arxiv_url_aliases(url: str) -> set[str]:
     return aliases
 
 
+def _dedup_scope(config: dict[str, Any]) -> str:
+    executor_config = config.get("executor") or {}
+    if executor_config.get("dedup_all_dates") or executor_config.get("announcement_backfill"):
+        return "all"
+    return "before"
+
+
 async def _collect_seen_identities(
-    corpus: Sequence[object], business_date: str
+    corpus: Sequence[object], business_date: str, *, scope: str = "before"
 ) -> tuple[set[str], set[str]]:
-    """URLs and content keys that must not consume a prefilter slot."""
+    """URLs and content keys that must not consume a prefilter slot.
+
+    `before` ignores recommendations saved on this date or later, which is the
+    daily and range-backfill rule. `all` excludes every other date, including
+    later ones, and still allows the papers already stored on this date.
+    """
     seen_urls: set[str] = set()
-    for url in await db.get_seen_paper_urls(before_date=business_date):
+    if scope == "all":
+        stored_urls = await db.get_seen_paper_urls(exclude_date=business_date)
+        seen_content_keys = await db.get_seen_paper_content_keys(exclude_date=business_date)
+    else:
+        stored_urls = await db.get_seen_paper_urls(before_date=business_date)
+        seen_content_keys = await db.get_seen_paper_content_keys(before_date=business_date)
+    for url in stored_urls:
         seen_urls.update(_arxiv_url_aliases(url))
-    seen_content_keys = await db.get_seen_paper_content_keys(before_date=business_date)
     for paper in corpus:
         title = getattr(paper, "title", None)
         if not title:
@@ -527,9 +545,15 @@ def _config_with_retrieval_context(
 
 
 async def _filter_seen_papers(
-    papers: list[Paper], corpus: Sequence[object], business_date: str
+    papers: list[Paper],
+    corpus: Sequence[object],
+    business_date: str,
+    *,
+    scope: str = "before",
 ) -> list[Paper]:
-    seen_urls, seen_content_keys = await _collect_seen_identities(corpus, business_date)
+    seen_urls, seen_content_keys = await _collect_seen_identities(
+        corpus, business_date, scope=scope
+    )
     filtered = []
     batch_keys = set()
 
@@ -624,6 +648,111 @@ class Executor:
             "date_count": len(dates),
             "final_recommendations": total_recommendations,
             "dates": summary,
+        }
+        return self.last_run_metrics
+
+    def _new_executor(self, config: dict[str, Any]) -> "Executor":
+        return self.__class__(config)
+
+    async def backfill_days(
+        self, dates: list[str | date], *, force: bool = False
+    ) -> dict[str, object]:
+        """Generate recommendations for historical dates, oldest first.
+
+        A date that already has recommendations is skipped unless force is set.
+        One date failing does not stop the later dates. Each successful date is
+        written before the next date starts.
+        """
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for value in dates:
+            day = _normalize_business_date(value)
+            if day in seen:
+                continue
+            seen.add(day)
+            ordered.append(day)
+        ordered.sort()
+        if not ordered:
+            raise ValueError("at least one date is required")
+        current = _get_business_date(self.config)
+        future = [day for day in ordered if day > current]
+        if future:
+            raise ValueError(
+                "backfill dates cannot be later than the current business date: "
+                + ", ".join(future)
+            )
+
+        summaries: list[dict[str, object]] = []
+        failed = 0
+        for business_date in ordered:
+            window_start, window_end, kind, source_date = _announcement_window_utc(business_date)
+            base_summary: dict[str, object] = {
+                "date": business_date,
+                "window_start": window_start.isoformat(),
+                "window_end": window_end.isoformat(),
+                "window_kind": kind,
+                "window_source": source_date,
+            }
+            existing = await db.get_papers_by_date(business_date)
+            if existing and not force:
+                summaries.append(
+                    {
+                        **base_summary,
+                        "status": "skipped",
+                        "recommendations": len(existing),
+                        "reason": "date already has recommendations",
+                    }
+                )
+                logger.info(
+                    f"Skipping {business_date}: {len(existing)} recommendations already saved"
+                )
+                continue
+
+            scoped_config = copy.deepcopy(self.config)
+            scoped_config.setdefault("executor", {})
+            scoped_config["executor"]["announcement_backfill"] = True
+            scoped_config["executor"]["dedup_all_dates"] = True
+            started = time.perf_counter()
+            try:
+                runner = self._new_executor(scoped_config)
+                papers = await runner.run_for_date(business_date)
+                metrics = dict(runner.last_run_metrics)
+                status = str(metrics.get("status") or "completed")
+                summaries.append(
+                    {
+                        **base_summary,
+                        "status": status,
+                        "recommendations": len(papers),
+                        "elapsed_seconds": round(time.perf_counter() - started, 3),
+                        "retrieved_candidates": metrics.get("retrieved_candidates", 0),
+                        "filtered_candidates": metrics.get("filtered_candidates", 0),
+                        "retrieval_stats": metrics.get("retrieval_stats") or {},
+                    }
+                )
+                logger.info(
+                    f"Announcement backfill {business_date}: {status}, {len(papers)} papers"
+                )
+            except Exception as exc:
+                failed += 1
+                logger.exception(f"Announcement backfill failed for {business_date}")
+                summaries.append(
+                    {
+                        **base_summary,
+                        "status": "failed",
+                        "recommendations": 0,
+                        "elapsed_seconds": round(time.perf_counter() - started, 3),
+                        "error": str(exc),
+                    }
+                )
+
+        self.last_run_metrics = {
+            "status": "partial" if failed else "completed",
+            "mode": "announcement_backfill",
+            "date_count": len(ordered),
+            "failed": failed,
+            "skipped": sum(1 for item in summaries if item["status"] == "skipped"),
+            "final_recommendations": sum(int(item["recommendations"]) for item in summaries),
+            "dates": summaries,
         }
         return self.last_run_metrics
 
@@ -739,7 +868,11 @@ class Executor:
         stage_started = time.perf_counter()
         profile = await _ensure_interest_profile(self.config, corpus, llm_ready=llm_ready)
         _finish_stage("profile", stage_started)
-        seen_urls, seen_content_keys = await _collect_seen_identities(corpus, business_date)
+        dedup_scope = _dedup_scope(self.config)
+        self.last_run_metrics["dedup_scope"] = dedup_scope
+        seen_urls, seen_content_keys = await _collect_seen_identities(
+            corpus, business_date, scope=dedup_scope
+        )
         retrieval_config = _config_with_retrieval_context(
             self.config, profile, seen_urls, seen_content_keys
         )
@@ -781,7 +914,9 @@ class Executor:
             return []
 
         self.last_run_metrics["retrieved_candidates"] = len(all_papers)
-        all_papers = await _filter_seen_papers(all_papers, corpus, business_date)
+        all_papers = await _filter_seen_papers(
+            all_papers, corpus, business_date, scope=_dedup_scope(self.config)
+        )
         self.last_run_metrics["filtered_candidates"] = len(all_papers)
         if not all_papers:
             logger.info("All retrieved papers were already in corpus or previously recommended")

@@ -667,6 +667,24 @@ def _cli_backfill_tldr(args: Any) -> None:
         raise SystemExit(1)
 
 
+def _cli_backfill_day(args: Any) -> None:
+    import asyncio
+
+    config = load_config()
+    dates = [str(value) for value in (args.date or [])]
+    if not dates:
+        raise SystemExit("pass --date")
+    for value in dates:
+        try:
+            date.fromisoformat(value)
+        except ValueError as exc:
+            raise SystemExit(f"invalid date {value}: expected YYYY-MM-DD") from exc
+    result = asyncio.run(Executor(config).backfill_days(dates, force=bool(args.force)))
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    if result.get("status") != "completed":
+        raise SystemExit(1)
+
+
 def main(argv: list[str] | None = None) -> None:
     import argparse
 
@@ -693,9 +711,27 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="On --date, skip papers that already have a TLDR.",
     )
+    backfill_day = sub.add_parser(
+        "backfill-day",
+        help="Generate recommendations for historical business dates from the arXiv API",
+    )
+    backfill_day.add_argument(
+        "--date",
+        action="append",
+        default=[],
+        help="Business date to generate, YYYY-MM-DD. Can be repeated.",
+    )
+    backfill_day.add_argument(
+        "--force",
+        action="store_true",
+        help="Regenerate a date even when recommendations are already saved.",
+    )
     args = parser.parse_args(argv)
     if args.command == "backfill-tldr":
         _cli_backfill_tldr(args)
+        return
+    if args.command == "backfill-day":
+        _cli_backfill_day(args)
         return
 
     import uvicorn
