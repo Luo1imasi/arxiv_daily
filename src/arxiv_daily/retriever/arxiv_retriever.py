@@ -4,7 +4,6 @@ import math
 import re
 import threading
 import time as time_module
-from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, cast, override
 
@@ -18,14 +17,21 @@ from .base import BaseRetriever, register_retriever
 from ..protocol import Paper, CorpusPaper
 from ..config import get_config_value
 from ..lexical import (
+    assign_term_weights,
     author_overlap_bonus,
     category_preference_bonus,
     category_weights_from_corpus,
-    corpus_author_surnames,
+    corpus_author_keys,
+    feedback_negative_terms,
+    negative_overlap_penalty,
+    phrase_bm25_scores,
+    sanitize_negative_terms,
+    term_support_units,
 )
 from .. import database as db
 from ..business_date import business_window_utc as _business_window_utc
 from ..business_date import get_business_date as _business_date
+from ..utils import make_content_key
 
 RawPaper = dict[str, object]
 _ARXIV = cast(Any, arxiv)
@@ -479,25 +485,88 @@ def _paper_with_scores(
 
 
 def _compute_keyword_match_score(
-    paper: RawPaper, keywords: list[str]
-) -> tuple[float, float]:
+    paper: RawPaper,
+    keywords: list[str],
+    weights: dict[str, float] | None = None,
+    *,
+    partial: bool = True,
+) -> tuple[float, float, float, float]:
+    """Return weighted score, weighted hits, core score, and core hits.
+
+    Core hits ignore broad phrases (weight below 0.75). The core score is
+    unweighted so one exact core phrase is always worth 2 when the penalty
+    taper is applied. Partial support (a mixed bigram or a distinctive
+    unigram) is only for positive core terms. Exclusion phrases stay exact,
+    so "visual slam" does not fire on the word "visual".
+    """
     text = f"{_paper_title(paper)} {_paper_summary(paper)}".lower()
-    exact_matches = 0
-    fuzzy_match_units = 0.0
+    score = 0.0
+    match_count = 0.0
+    core_score = 0.0
+    core_hits = 0.0
+    credited_bigrams: set[str] = set()
+    credited_unigrams: set[str] = set()
 
     for kw in keywords:
         kw_lower = kw.lower().strip()
         if not kw_lower:
             continue
+        weight = 1.0
+        if weights:
+            weight = float(weights.get(kw, weights.get(kw_lower, 1.0)))
+        if weight <= 0:
+            continue
+        core = weight >= 0.75
+        full, bigrams, unigrams = term_support_units(kw_lower)
+        phrase = full or kw_lower
+        if _match_with_word_boundary(text, phrase):
+            score += 2.0 * weight
+            match_count += weight
+            if core:
+                core_score += 2.0
+                core_hits += 1.0
+                credited_bigrams.update(bigrams)
+                credited_unigrams.update(unigrams)
+        elif phrase in text:
+            score += 0.5 * weight
+            match_count += 0.5 * weight
+            if core:
+                core_score += 0.5
+                core_hits += 0.5
+                credited_bigrams.update(bigrams)
+                credited_unigrams.update(unigrams)
+        elif core and partial:
+            bigram = next(
+                (
+                    unit
+                    for unit in bigrams
+                    if unit not in credited_bigrams and _match_with_word_boundary(text, unit)
+                ),
+                None,
+            )
+            if bigram:
+                credited_bigrams.add(bigram)
+                score += 1.0 * weight
+                match_count += 0.5 * weight
+                core_score += 1.0
+                core_hits += 1.0
+                continue
+            unigram = next(
+                (
+                    unit
+                    for unit in unigrams
+                    if unit not in credited_unigrams and _match_with_word_boundary(text, unit)
+                ),
+                None,
+            )
+            if unigram:
+                credited_unigrams.add(unigram)
+                score += 0.75 * weight
+                match_count += 0.35 * weight
+                core_score += 0.75
+                core_hits += 1.0
 
-        if _match_with_word_boundary(text, kw_lower):
-            exact_matches += 1
-        elif kw_lower in text:
-            fuzzy_match_units += 0.5
-
-    score = exact_matches * 2.0 + fuzzy_match_units
-    match_count = exact_matches + fuzzy_match_units
-    return score, match_count
+    return score, match_count, core_score, core_hits
 
 
 def _tokenize(text: str) -> list[str]:
@@ -551,48 +620,19 @@ def _extract_local_keywords_from_corpus(corpus: list[CorpusPaper], limit: int) -
     return [phrase for _, _, phrase in scored[:limit]]
 
 
-def _compute_bm25_scores(papers: list[RawPaper], query_terms: list[str]) -> dict[str, float]:
+def _compute_bm25_scores(
+    papers: list[RawPaper],
+    query_terms: list[str],
+    weights: dict[str, float] | None = None,
+) -> dict[str, float]:
     if not papers or not query_terms:
         return {}
-
-    tokenized_docs: list[tuple[str, list[str]]] = []
-    doc_freq: Counter[str] = Counter()
-    for paper in papers:
-        tokens = _tokenize(f"{_paper_title(paper)} {_paper_summary(paper)}")
-        tokenized_docs.append((_paper_entry_id(paper), tokens))
-        for token in set(tokens):
-            doc_freq[token] += 1
-
-    avgdl = sum(len(tokens) for _, tokens in tokenized_docs) / max(len(tokenized_docs), 1)
-    query_token_counts: Counter[str] = Counter()
-    for term in query_terms:
-        query_token_counts.update(_tokenize(term))
-    if not query_token_counts:
-        return {}
-
-    k1 = 1.5
-    b = 0.75
-    total_docs = len(tokenized_docs)
-    scores = {}
-    for paper_id, tokens in tokenized_docs:
-        if not tokens:
-            scores[paper_id] = 0.0
-            continue
-        tf = Counter(tokens)
-        doc_len = len(tokens)
-        score = 0.0
-        for token, qf in query_token_counts.items():
-            df = doc_freq.get(token, 0)
-            if not df:
-                continue
-            idf = math.log(1 + (total_docs - df + 0.5) / (df + 0.5))
-            freq = tf.get(token, 0)
-            if not freq:
-                continue
-            denom = freq + k1 * (1 - b + b * doc_len / max(avgdl, 1e-6))
-            score += qf * idf * (freq * (k1 + 1)) / denom
-        scores[paper_id] = score
-    return scores
+    texts = [f"{_paper_title(paper)} {_paper_summary(paper)}" for paper in papers]
+    scores = phrase_bm25_scores(texts, query_terms, weights)
+    return {
+        _paper_entry_id(paper): float(score)
+        for paper, score in zip(papers, scores)
+    }
 
 
 def _normalize_scores(scores: dict[str, float]) -> dict[str, float]:
@@ -684,7 +724,7 @@ class ArxivRetriever(BaseRetriever):
         self._rank_seconds = 0.0
         self._semantic_seconds = 0.0
         self._last_rank_stats: dict[str, int] = {}
-        self._author_surnames_cache: set[str] | None = None
+        self._author_keys_cache: dict[str, int] | None = None
         self._category_weights_cache: dict[str, float] | None = None
 
     def _publish_retrieval_stats(self, export_calls: int) -> None:
@@ -836,20 +876,29 @@ class ArxivRetriever(BaseRetriever):
             for term in profile.get("canonical_terms") or []
             if str(term).strip()
         ]
-        negative = [
+        profile_negative = [
             str(term).strip()
-            for term in profile.get("not_interested") or []
+            for term in profile.get("negative_terms") or []
             if str(term).strip()
         ]
+        if not profile_negative:
+            profile_negative = [
+                str(term).strip()
+                for term in profile.get("not_interested") or []
+                if re.search(r"[A-Za-z]", str(term))
+            ]
+        negative = sanitize_negative_terms(profile_negative)
         feedback = await db.list_feedback()
-        negative_counts: Counter[str] = Counter()
-        for row in feedback:
-            if row.get("vote") != "irrelevant":
-                continue
-            negative_counts.update(_tokenize(str(row.get("title") or "")))
-        for term, _count in negative_counts.most_common(12):
-            if term not in negative:
+        feedback_titles = [
+            str(row.get("title") or "")
+            for row in feedback
+            if row.get("vote") == "irrelevant"
+        ]
+        existing = {term.lower() for term in negative}
+        for term in feedback_negative_terms(feedback_titles):
+            if term.lower() not in existing:
                 negative.append(term)
+                existing.add(term.lower())
         if terms:
             limited = terms[: self.max_keywords]
             logger.info(f"Using {len(limited)} canonical terms from the interest profile")
@@ -1198,11 +1247,59 @@ class ArxivRetriever(BaseRetriever):
 
         return _run_arxiv_call(_fetch, description="search")
 
-    def _library_author_surnames(self) -> set[str]:
-        if self._author_surnames_cache is None:
-            self._author_surnames_cache = corpus_author_surnames(self._corpus)
-            logger.info(f"Library author surnames: {len(self._author_surnames_cache)}")
-        return self._author_surnames_cache
+    def _library_author_keys(self) -> dict[str, int]:
+        if self._author_keys_cache is None:
+            self._author_keys_cache = corpus_author_keys(self._corpus)
+            logger.info(f"Library author keys: {len(self._author_keys_cache)}")
+        return self._author_keys_cache
+
+    def _seen_identities(self) -> tuple[set[str], set[str]]:
+        urls = self.config.get("seen_paper_urls") or []
+        keys = self.config.get("seen_content_keys") or []
+        return {str(url) for url in urls if url}, {str(key) for key in keys if key}
+
+    def _paper_is_seen(self, paper: RawPaper, seen_urls: set[str], seen_keys: set[str]) -> bool:
+        if not seen_urls and not seen_keys:
+            return False
+        entry_id = _paper_entry_id(paper)
+        if entry_id and entry_id in seen_urls:
+            return True
+        title = _paper_title(paper).strip()
+        if title and seen_keys:
+            if make_content_key(title, _paper_summary(paper)) in seen_keys:
+                return True
+        return False
+
+    def _negative_terms_for_rank(self) -> list[str]:
+        if self._negative_terms:
+            return list(self._negative_terms)
+        profile = self.config.get("interest_profile") or {}
+        if not isinstance(profile, dict):
+            return []
+        terms = [str(term).strip() for term in profile.get("negative_terms") or [] if str(term).strip()]
+        if not terms:
+            terms = [
+                str(term).strip()
+                for term in profile.get("not_interested") or []
+                if re.search(r"[A-Za-z]", str(term))
+            ]
+        return sanitize_negative_terms(terms)
+
+    def _ranking_keywords(self, keywords: list[str]) -> list[str]:
+        profile = self.config.get("interest_profile") or {}
+        if not isinstance(profile, dict):
+            profile = {}
+        merged: list[str] = []
+        seen: set[str] = set()
+        extras = list(profile.get("core_terms") or []) + list(profile.get("broad_terms") or [])
+        for term in list(keywords) + extras:
+            text = str(term).strip()
+            key = text.lower()
+            if len(text) < 3 or key in seen:
+                continue
+            seen.add(key)
+            merged.append(text)
+        return merged
 
     def _library_category_weights(self) -> dict[str, float]:
         if self._category_weights_cache is None:
@@ -1234,6 +1331,7 @@ class ArxivRetriever(BaseRetriever):
             }
             return []
 
+        keywords = self._ranking_keywords(keywords)
         logger.info(
             f"Ranking {len(papers)} candidate papers with {len(keywords)} keywords..."
         )
@@ -1241,15 +1339,30 @@ class ArxivRetriever(BaseRetriever):
 
         min_match_count = float(get_config_value(self.config, "source.arxiv.min_keyword_matches"))
         use_bm25 = bool(get_config_value(self.config, "source.arxiv.use_bm25_scoring"))
-        bm25_scores = _compute_bm25_scores(papers, keywords) if use_bm25 else {}
+        profile = self.config.get("interest_profile") or {}
+        if not isinstance(profile, dict):
+            profile = {}
+        term_texts = [f"{_paper_title(paper)} {_paper_summary(paper)}" for paper in papers]
+        term_weights = assign_term_weights(
+            keywords,
+            term_texts,
+            core_terms=list(profile.get("core_terms") or []),
+            broad_terms=list(profile.get("broad_terms") or []),
+        )
+        bm25_scores = _compute_bm25_scores(papers, keywords, term_weights) if use_bm25 else {}
         bm25_scores = _normalize_scores(bm25_scores)
         prefilter_limit = int(get_config_value(self.config, "source.arxiv.llm_prefilter_limit", 200))
+        broad_backfill_limit = int(
+            get_config_value(self.config, "source.arxiv.broad_backfill_limit", 100)
+        )
         author_weight = float(get_config_value(self.config, "source.arxiv.author_overlap_weight", 0.6))
         category_scale = float(
             get_config_value(self.config, "source.arxiv.category_preference_weight", 0.8)
         )
-        library_surnames = self._library_author_surnames() if author_weight > 0 else set()
+        library_authors = self._library_author_keys() if author_weight > 0 else {}
         category_weights = self._library_category_weights() if category_scale > 0 else {}
+        negative_terms = self._negative_terms_for_rank()
+        seen_urls, seen_keys = self._seen_identities()
 
         def _recency_bonus(published: datetime | None) -> float:
             if published is None:
@@ -1265,23 +1378,29 @@ class ArxivRetriever(BaseRetriever):
             )
             return float(math.exp(-age_days / self.recency_half_life_days))
 
-        # hybrid, lexical_hybrid, match, bm25, match_count, recency, retrieval, paper
-        cheap_rows: list[tuple[float, float, float, float, float, float, float, RawPaper]] = []
+        # hybrid, lexical, match, bm25, match_count, recency, retrieval, core_hits, negative_count, paper
+        cheap_rows: list[tuple[float, float, float, float, float, float, float, float, float, RawPaper]] = []
+        seen_skipped = 0
         for paper in papers:
-            match_score, match_count = _compute_keyword_match_score(paper, keywords)
+            if self._paper_is_seen(paper, seen_urls, seen_keys):
+                seen_skipped += 1
+                continue
+            match_score, match_count, core_score, core_hits = _compute_keyword_match_score(
+                paper, keywords, term_weights
+            )
             bm25_score = bm25_scores.get(_paper_entry_id(paper), 0.0)
-            negative_score, negative_count = (
-                _compute_keyword_match_score(paper, self._negative_terms)
-                if self._negative_terms
-                else (0.0, 0.0)
+            negative_score, negative_count, _, _ = (
+                _compute_keyword_match_score(paper, negative_terms, partial=False)
+                if negative_terms
+                else (0.0, 0.0, 0.0, 0.0)
             )
             recency_bonus = _recency_bonus(_paper_published(paper))
             text_score = match_score + bm25_score * 4.0
             negative_penalty = (
-                min(negative_score, 4.0) if negative_count and match_count == 0 else 0.0
+                negative_overlap_penalty(negative_score, core_score) if negative_count else 0.0
             )
             overlap_bonus = author_overlap_bonus(
-                _raw_paper_authors(paper), library_surnames, author_weight
+                _raw_paper_authors(paper), library_authors, author_weight
             )
             category_bonus = category_preference_bonus(
                 _raw_paper_primary_category(paper),
@@ -1289,6 +1408,7 @@ class ArxivRetriever(BaseRetriever):
                 category_weights,
                 category_scale,
             )
+            # Admission uses the text score only. Recency still breaks ties below.
             retrieval_score = text_score - negative_penalty
             lexical_hybrid = retrieval_score + recency_bonus * 0.75
             hybrid_score = lexical_hybrid + overlap_bonus + category_bonus
@@ -1301,31 +1421,48 @@ class ArxivRetriever(BaseRetriever):
                     match_count,
                     recency_bonus,
                     retrieval_score,
+                    core_hits,
+                    float(negative_count),
                     paper,
                 )
             )
         cheap_rows.sort(key=lambda row: (-row[0], -row[2], -row[3], -row[4]))
 
-        limit = len(cheap_rows) if prefilter_limit <= 0 else prefilter_limit
+        # Core hits occupy the list first. Broad-only papers may fill what is
+        # left, and the configured cap stops the list growing past that.
+        if prefilter_limit <= 0:
+            limit = len(cheap_rows)
+        else:
+            limit = prefilter_limit
+        if broad_backfill_limit > 0:
+            limit = min(limit, broad_backfill_limit)
         scored_papers: list[tuple[float, float, float, float, float, RawPaper]] = []
         seen_ids: set[str] = set()
         for (
             hybrid_score,
-            lexical_hybrid,
+            _lexical_hybrid,
             match_score,
             bm25_score,
             match_count,
             recency_bonus,
             retrieval_score,
+            core_hits,
+            _negative_count,
             paper,
         ) in cheap_rows:
-            if not (match_count >= min_match_count or lexical_hybrid >= 1.5):
+            # A broad-only hit never satisfies the gate. Recency is not part of it.
+            passes_gate = core_hits >= min_match_count or (
+                core_hits > 0 and retrieval_score >= 1.5
+            )
+            if not passes_gate:
                 continue
             paper_id = _paper_entry_id(paper)
             if paper_id in seen_ids:
                 continue
             seen_ids.add(paper_id)
             lookback_score = hybrid_score * (1.0 + min(match_count, 3.0))
+            kept = _paper_with_scores(paper, retrieval_score, lookback_score, bm25_score)
+            kept["prefilter_tier"] = "core"
             scored_papers.append(
                 (
                     hybrid_score,
@@ -1333,7 +1470,7 @@ class ArxivRetriever(BaseRetriever):
                     bm25_score,
                     match_count,
                     recency_bonus,
-                    _paper_with_scores(paper, retrieval_score, lookback_score, bm25_score),
+                    kept,
                 )
             )
             if len(scored_papers) >= limit:
@@ -1341,32 +1478,69 @@ class ArxivRetriever(BaseRetriever):
 
         matched_papers = [paper for *_, paper in scored_papers]
         matched_before_backfill = len(matched_papers)
+        broad_backfill_count = 0
 
-        fallback_scored: list[tuple[float, float, float, RawPaper]] = []
-        for paper in papers:
-            bm25_score = bm25_scores.get(_paper_entry_id(paper), 0.0)
-            recency_bonus = _recency_bonus(_paper_published(paper))
-            retrieval_score = bm25_score * 4.0
-            fallback_score = retrieval_score + recency_bonus
-            lookback_score = fallback_score * 0.75
-            fallback_scored.append(
-                (
-                    fallback_score,
-                    bm25_score,
-                    recency_bonus,
-                    _paper_with_scores(paper, retrieval_score, lookback_score, bm25_score),
-                )
-            )
-        fallback_scored.sort(key=lambda item: (-item[0], -item[1], -item[2]))
-
-        backfilled_count = 0
+        # Coarse ranking is cheap, so a short core list is topped up with
+        # broad hits that did not touch an exclusion phrase. They stay behind
+        # every core paper and are ordered by text score alone.
         if len(matched_papers) < limit:
-            if not matched_papers:
-                logger.warning(
-                    "Keyword ranking yielded no matches, falling back to BM25/recency ranking"
+            broad_rows: list[tuple[float, float, RawPaper]] = []
+            for (
+                _hybrid_score,
+                _lexical_hybrid,
+                match_score,
+                row_bm25,
+                match_count,
+                _row_recency,
+                retrieval_score,
+                core_hits,
+                negative_count,
+                paper,
+            ) in cheap_rows:
+                if core_hits > 0 or match_count <= 0 or negative_count > 0:
+                    continue
+                paper_id = _paper_entry_id(paper)
+                if paper_id in seen_ids:
+                    continue
+                kept = _paper_with_scores(paper, retrieval_score, retrieval_score, row_bm25)
+                kept["prefilter_tier"] = "broad"
+                broad_rows.append((retrieval_score, match_score, kept))
+            broad_rows.sort(key=lambda item: (-item[0], -item[1]))
+            for _retrieval_score, _match_score, paper in broad_rows:
+                paper_id = _paper_entry_id(paper)
+                if paper_id in seen_ids:
+                    continue
+                seen_ids.add(paper_id)
+                matched_papers.append(paper)
+                broad_backfill_count += 1
+                if len(matched_papers) >= limit:
+                    break
+
+        backfilled_count = broad_backfill_count
+        if not matched_papers:
+            logger.warning(
+                "Keyword ranking yielded no matches, falling back to BM25/recency ranking"
+            )
+            fallback_scored: list[tuple[float, float, float, RawPaper]] = []
+            for paper in papers:
+                if self._paper_is_seen(paper, seen_urls, seen_keys):
+                    continue
+                bm25_score = bm25_scores.get(_paper_entry_id(paper), 0.0)
+                recency_bonus = _recency_bonus(_paper_published(paper))
+                retrieval_score = bm25_score * 4.0
+                fallback_score = retrieval_score + recency_bonus
+                lookback_score = fallback_score * 0.75
+                fallback_scored.append(
+                    (
+                        fallback_score,
+                        bm25_score,
+                        recency_bonus,
+                        _paper_with_scores(paper, retrieval_score, lookback_score, bm25_score),
+                    )
                 )
-            existing_ids = {_paper_entry_id(paper) for paper in matched_papers}
-            backfilled = list(matched_papers)
+            fallback_scored.sort(key=lambda item: (-item[0], -item[1], -item[2]))
+            backfilled: list[RawPaper] = []
+            existing_ids: set[str] = set()
             for _, _, _, paper in fallback_scored:
                 paper_id = _paper_entry_id(paper)
                 if paper_id in existing_ids:
@@ -1375,7 +1549,7 @@ class ArxivRetriever(BaseRetriever):
                 backfilled.append(paper)
                 if len(backfilled) >= limit:
                     break
-            backfilled_count = len(backfilled) - len(matched_papers)
+            backfilled_count = len(backfilled)
             if backfilled_count:
                 logger.info(f"Backfilled {backfilled_count} additional BM25/recency papers")
             matched_papers = backfilled
@@ -1386,15 +1560,19 @@ class ArxivRetriever(BaseRetriever):
             "semantic_input_count": len(matched_papers),
             "held_back_count": max(len(papers) - len(matched_papers), 0),
             "matched_before_backfill": matched_before_backfill,
+            "core_count": matched_before_backfill,
+            "broad_backfill_count": broad_backfill_count,
             "backfilled": backfilled_count,
             "tail_kept": backfilled_count,
             "final_count": len(matched_papers),
+            "seen_skipped": seen_skipped,
+            "broad_backfill_limit": broad_backfill_limit,
         }
         logger.info(
             f"Cheap prefilter kept {len(matched_papers)} of {len(papers)} candidates "
-            f"for LLM coarse ranking (limit={prefilter_limit}, "
-            f"min_matches={min_match_count}, bm25={use_bm25}, "
-            f"backfilled={backfilled_count})"
+            f"for LLM coarse ranking (limit={limit}, core={matched_before_backfill}, "
+            f"broad_backfill={broad_backfill_count}, min_matches={min_match_count}, "
+            f"bm25={use_bm25})"
         )
         if matched_papers and logger.level("DEBUG").no >= logger.level("INFO").no:
             logger.info("Top matches:")

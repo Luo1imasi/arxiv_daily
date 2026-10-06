@@ -17,6 +17,7 @@ from openai import (
 from openai.types.chat import ChatCompletionMessageParam
 
 from .config import get_config_value
+from .lexical import sanitize_negative_terms
 from .utils import retry_call
 
 
@@ -24,7 +25,7 @@ PROMPT_VERSIONS = {
     "extract": "keywords-v2",
     "summarize": "tldr-v3",
     "judge": "judge-v1",
-    "profile": "profile-v1",
+    "profile": "profile-v2",
     "qa": "qa-v1",
     "coarse": "coarse-v1",
 }
@@ -653,6 +654,40 @@ def _call_json(
     return parsed
 
 
+def profile_has_rank_tiers(profile: dict[str, Any] | None) -> bool:
+    """True when a cached profile can drive English penalties and term tiers.
+
+    Legacy profiles only have Chinese ``not_interested`` and a flat
+    ``canonical_terms`` list. Those should be rebuilt. A profile that names
+    exclusions but produced no usable English phrases is also incomplete.
+    """
+    if not isinstance(profile, dict):
+        return False
+    if "negative_terms" not in profile:
+        return False
+    if not profile.get("core_terms") and not profile.get("broad_terms"):
+        return False
+    if profile.get("not_interested") and not profile.get("negative_terms"):
+        return False
+    return True
+
+
+def _merge_search_terms(*groups: list[str], limit: int) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for term in group:
+            text = str(term).strip()
+            key = text.lower()
+            if len(text) < 3 or key in seen:
+                continue
+            seen.add(key)
+            merged.append(text)
+            if len(merged) >= limit:
+                return merged
+    return merged
+
+
 def build_interest_profile(
     papers: list[dict[str, str]],
     feedback: list[dict[str, str]],
@@ -676,9 +711,18 @@ def build_interest_profile(
     ][:12]
     prompt = (
         "根据下面的论文库和阅读反馈，生成结构化兴趣画像。\n"
-        "canonical_terms 必须是英文规范术语，适合放进 arXiv 的 abs:/ti: 查询，"
-        "合并同义词，不要堆近义说法。\n"
-        f"summary、topics、methods、not_interested、representative_papers 用{language}。\n\n"
+        "检索词用英文，适合放进 arXiv 的 abs:/ti: 查询，合并同义词，不要堆近义说法。\n"
+        "core_terms：4 到 8 个最能代表读者的具体英文短语，例如 "
+        "\"humanoid whole-body control\"、\"loco-manipulation\"。\n"
+        "broad_terms：3 到 8 个相关但过宽的英文短语，例如 "
+        "\"reinforcement learning\"、\"model predictive control\"、\"sim-to-real\"。\n"
+        "canonical_terms 必须覆盖 core_terms 和 broad_terms，不要另造一套同义词。\n"
+        "negative_terms：3 到 10 个具体英文排除短语，用来匹配英文标题和摘要。"
+        "根据不感兴趣的方向，以及标为不相关的论文标题来写。"
+        "必须是能整短语命中的说法，例如 \"parallel ankle mechanism\"、\"visual slam\"。"
+        "不要输出 learning、model、robot、control、data、network 这种单词。\n"
+        f"summary、topics、methods、not_interested、representative_papers 用{language}。\n"
+        "not_interested 用读者语言写排除方向；negative_terms 是这些方向的英文短语。\n\n"
         "论文库：\n"
         + "\n".join(lines)
         + "\n\n标为相关的反馈：\n"
@@ -687,24 +731,38 @@ def build_interest_profile(
         + ("\n".join(f"- {title}" for title in negative) or "无")
         + "\n\n只返回 JSON："
         '{"summary":"","topics":[],"methods":[],"not_interested":[],'
-        '"representative_papers":[],"canonical_terms":[]}'
+        '"representative_papers":[],"canonical_terms":[],'
+        '"core_terms":[],"broad_terms":[],"negative_terms":[]}'
     )
     parsed = _call_json(
         config,
         role="profile",
         system="你维护一位研究者的兴趣画像，只返回 JSON。",
         user=prompt,
-        max_tokens=1800,
+        max_tokens=2400,
     )
     if not parsed:
         return None
+    core_terms = _string_list(parsed.get("core_terms"), 8)
+    broad_terms = _string_list(parsed.get("broad_terms"), 8)
+    canonical_terms = _merge_search_terms(
+        core_terms,
+        broad_terms,
+        _string_list(parsed.get("canonical_terms"), 16),
+        limit=16,
+    )
     profile = {
         "summary": _clip(str(parsed.get("summary") or ""), 400),
         "topics": _string_list(parsed.get("topics"), 8),
         "methods": _string_list(parsed.get("methods"), 8),
         "not_interested": _string_list(parsed.get("not_interested"), 8),
         "representative_papers": _string_list(parsed.get("representative_papers"), 6),
-        "canonical_terms": _string_list(parsed.get("canonical_terms"), 12),
+        "canonical_terms": canonical_terms,
+        "core_terms": core_terms,
+        "broad_terms": broad_terms,
+        "negative_terms": sanitize_negative_terms(
+            _string_list(parsed.get("negative_terms"), 10)
+        ),
     }
     if not profile["canonical_terms"]:
         profile["canonical_terms"] = _string_list(
@@ -731,6 +789,7 @@ def judge_papers(
             "topics": profile.get("topics") or [],
             "methods": profile.get("methods") or [],
             "not_interested": profile.get("not_interested") or [],
+            "negative_terms": profile.get("negative_terms") or [],
         },
         ensure_ascii=False,
     )

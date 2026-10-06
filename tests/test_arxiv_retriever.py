@@ -1040,7 +1040,7 @@ class PrefilterLimitTests(unittest.TestCase):
                 entry_id="overlap",
                 title="alpha beta",
                 summary="robot",
-                authors=["Ann Peng"],
+                authors=["Xue Peng"],
                 published="2026-04-22T12:00:00+00:00",
                 primary_category="cs.CL",
             ),

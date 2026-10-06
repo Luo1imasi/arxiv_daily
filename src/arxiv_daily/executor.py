@@ -3,6 +3,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import re
 import threading
 import time
 import concurrent.futures
@@ -26,6 +27,7 @@ from .llm import (
     make_llm_cache_key,
     note_llm_error,
     note_llm_warning,
+    profile_has_rank_tiers,
     reset_llm_usage,
     resolve_model,
 )
@@ -186,13 +188,14 @@ async def _ensure_interest_profile(
     model = resolve_model(config, "profile")
     prompt_version = PROMPT_VERSIONS["profile"]
     cached_profile = (cached or {}).get("profile") if cached else None
+    cache_usable = bool(cached_profile) and profile_has_rank_tiers(cached_profile)
     if (
         cached
         and cached.get("corpus_signature") == corpus_signature
         and cached.get("feedback_signature") == feedback_signature
         and cached.get("model") == model
         and cached.get("prompt_version") == prompt_version
-        and cached_profile
+        and cache_usable
     ):
         logger.info("Using cached interest profile")
         return cached_profile
@@ -470,16 +473,63 @@ async def _apply_tldr_enrichment(
     _merge_llm_usage(metrics)
 
 
+def _arxiv_url_aliases(url: str) -> set[str]:
+    text = str(url or "").strip()
+    if not text:
+        return set()
+    aliases = {text}
+    if text.startswith("https://"):
+        aliases.add("http://" + text[len("https://") :])
+    elif text.startswith("http://"):
+        aliases.add("https://" + text[len("http://") :])
+    match = re.search(r"arxiv\.org/(?:abs|pdf)/([^?#\s]+)", text, re.IGNORECASE)
+    if not match:
+        return aliases
+    short = match.group(1)
+    if short.lower().endswith(".pdf"):
+        short = short[:-4]
+    aliases.add(short)
+    aliases.add(f"http://arxiv.org/abs/{short}")
+    aliases.add(f"https://arxiv.org/abs/{short}")
+    return aliases
+
+
+async def _collect_seen_identities(
+    corpus: Sequence[object], business_date: str
+) -> tuple[set[str], set[str]]:
+    """URLs and content keys that must not consume a prefilter slot."""
+    seen_urls: set[str] = set()
+    for url in await db.get_seen_paper_urls(before_date=business_date):
+        seen_urls.update(_arxiv_url_aliases(url))
+    seen_content_keys = await db.get_seen_paper_content_keys(before_date=business_date)
+    for paper in corpus:
+        title = getattr(paper, "title", None)
+        if not title:
+            continue
+        seen_content_keys.add(
+            make_content_key(title, getattr(paper, "abstract", "") or "")
+        )
+    return seen_urls, seen_content_keys
+
+
+def _config_with_retrieval_context(
+    config: dict[str, Any],
+    profile: dict[str, Any] | None,
+    seen_urls: set[str],
+    seen_content_keys: set[str],
+) -> dict[str, Any]:
+    retrieval_config = copy.deepcopy(config)
+    if profile:
+        retrieval_config["interest_profile"] = profile
+    retrieval_config["seen_paper_urls"] = sorted(seen_urls)
+    retrieval_config["seen_content_keys"] = sorted(seen_content_keys)
+    return retrieval_config
+
+
 async def _filter_seen_papers(
     papers: list[Paper], corpus: Sequence[object], business_date: str
 ) -> list[Paper]:
-    seen_urls = await db.get_seen_paper_urls(before_date=business_date)
-    seen_content_keys = await db.get_seen_paper_content_keys(before_date=business_date)
-    corpus_content_keys = {
-        make_content_key(getattr(paper, "title", ""), getattr(paper, "abstract", "") or "")
-        for paper in corpus
-        if getattr(paper, "title", None)
-    }
+    seen_urls, seen_content_keys = await _collect_seen_identities(corpus, business_date)
     filtered = []
     batch_keys = set()
 
@@ -491,8 +541,6 @@ async def _filter_seen_papers(
         if paper.url and paper.url in seen_urls:
             continue
         if content_key and content_key in seen_content_keys:
-            continue
-        if content_key and content_key in corpus_content_keys:
             continue
 
         batch_keys.add(identity)
@@ -691,9 +739,10 @@ class Executor:
         stage_started = time.perf_counter()
         profile = await _ensure_interest_profile(self.config, corpus, llm_ready=llm_ready)
         _finish_stage("profile", stage_started)
-        retrieval_config = copy.deepcopy(self.config)
-        if profile:
-            retrieval_config["interest_profile"] = profile
+        seen_urls, seen_content_keys = await _collect_seen_identities(corpus, business_date)
+        retrieval_config = _config_with_retrieval_context(
+            self.config, profile, seen_urls, seen_content_keys
+        )
 
         async def _retrieve_source(source: str) -> tuple[str, list[Paper]]:
             logger.info(f"Retrieving {source} papers...")

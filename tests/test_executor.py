@@ -13,12 +13,14 @@ from arxiv_daily.executor import (
     Executor,
     _apply_tldr_enrichment,
     _default_llm_metrics,
+    _ensure_interest_profile,
     _fallback_tldr,
     _filter_seen_papers,
     _profile_signatures,
     _select_judged_papers,
     plan_tldr_backfill,
 )
+from arxiv_daily.llm import PROMPT_VERSIONS
 from arxiv_daily.protocol import CorpusPaper
 from arxiv_daily.protocol import Paper
 from arxiv_daily.retriever.base import BaseRetriever, register_retriever
@@ -339,6 +341,90 @@ class ProfileSignatureTests(unittest.TestCase):
 
         self.assertEqual(before[0], after[0])
         self.assertNotEqual(before[1], after[1])
+
+
+class InterestProfileCacheTests(unittest.IsolatedAsyncioTestCase):
+    async def test_legacy_profile_rebuilds_and_falls_back_when_llm_is_down(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_data_dir = os.environ.get("ARXIV_DAILY_DATA")
+            os.environ["ARXIV_DAILY_DATA"] = tmpdir
+            try:
+                await db.init_db()
+                corpus = [
+                    CorpusPaper(
+                        title="Humanoid whole-body control",
+                        abstract="Loco-manipulation on rough terrain.",
+                        added_date=datetime(2026, 10, 6),
+                    )
+                ]
+                corpus_signature, feedback_signature = _profile_signatures(corpus, [])
+                legacy = {
+                    "summary": "旧画像",
+                    "topics": ["人形控制"],
+                    "methods": [],
+                    "not_interested": ["通用强化学习理论"],
+                    "representative_papers": [],
+                    "canonical_terms": ["humanoid whole-body control"],
+                }
+                await db.save_interest_profile(
+                    legacy,
+                    corpus_signature=corpus_signature,
+                    feedback_signature=feedback_signature,
+                    model="grok-4.7",
+                    prompt_version="profile-v1",
+                )
+                config = {
+                    "llm": {
+                        "model": "grok-4.7",
+                        "language": "Chinese",
+                        "models": {"profile": "grok-4.7"},
+                    }
+                }
+                fresh = {
+                    "summary": "新画像",
+                    "topics": ["人形控制"],
+                    "methods": [],
+                    "not_interested": ["通用强化学习理论"],
+                    "representative_papers": [],
+                    "canonical_terms": ["humanoid whole-body control", "reinforcement learning"],
+                    "core_terms": ["humanoid whole-body control"],
+                    "broad_terms": ["reinforcement learning"],
+                    "negative_terms": ["ankle mechanism"],
+                }
+                with patch(
+                    "arxiv_daily.executor.build_interest_profile", return_value=fresh
+                ) as build:
+                    rebuilt = await _ensure_interest_profile(config, corpus, llm_ready=True)
+                build.assert_called_once()
+                self.assertEqual(rebuilt["negative_terms"], ["ankle mechanism"])
+                self.assertEqual(rebuilt["core_terms"], ["humanoid whole-body control"])
+
+                with patch(
+                    "arxiv_daily.executor.build_interest_profile", return_value=fresh
+                ) as build_again:
+                    cached = await _ensure_interest_profile(config, corpus, llm_ready=True)
+                build_again.assert_not_called()
+                self.assertEqual(cached["negative_terms"], ["ankle mechanism"])
+
+                await db.save_interest_profile(
+                    legacy,
+                    corpus_signature=corpus_signature,
+                    feedback_signature=feedback_signature,
+                    model="grok-4.7",
+                    prompt_version=PROMPT_VERSIONS["profile"],
+                )
+                with patch(
+                    "arxiv_daily.executor.build_interest_profile", return_value=fresh
+                ) as offline:
+                    fallback = await _ensure_interest_profile(config, corpus, llm_ready=False)
+                offline.assert_not_called()
+                self.assertEqual(fallback["canonical_terms"], ["humanoid whole-body control"])
+                self.assertNotIn("negative_terms", fallback)
+            finally:
+                if old_data_dir is None:
+                    os.environ.pop("ARXIV_DAILY_DATA", None)
+                else:
+                    os.environ["ARXIV_DAILY_DATA"] = old_data_dir
 
 
 class CandidateEnrichmentCacheTests(unittest.IsolatedAsyncioTestCase):

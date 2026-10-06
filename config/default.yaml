@@ -22,6 +22,9 @@ source:
     semantic_mix: 0.45
     semantic_prefilter_limit: 300
     llm_prefilter_limit: 200
+    # Core hits are kept first. Broad-only hits may fill the rest, but the
+    # whole prefilter list never grows past this cap.
+    broad_backfill_limit: 100
     author_overlap_weight: 0.6
     category_preference_weight: 0.8
     pre_rerank_limit: 120

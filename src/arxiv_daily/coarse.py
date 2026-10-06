@@ -55,6 +55,7 @@ def _profile_text(profile: dict[str, Any] | None) -> str:
         "topics": list(profile.get("topics") or [])[:8],
         "methods": list(profile.get("methods") or [])[:8],
         "not_interested": list(profile.get("not_interested") or [])[:8],
+        "negative_terms": list(profile.get("negative_terms") or [])[:10],
     }
     return json.dumps(payload, ensure_ascii=False)
 
