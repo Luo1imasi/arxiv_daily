@@ -27,6 +27,13 @@ _FEEDPARSER = cast(Any, feedparser)
 _ARXIV_REQUEST_LOCK = threading.Lock()
 _last_arxiv_request_at = 0.0
 _ARXIV_MIN_REQUEST_INTERVAL_SECONDS = 5.0
+_export_call_count = 0
+LAST_RETRIEVAL_STATS: dict[str, object] = {}
+_RSS_ABSTRACT_PREFIX = re.compile(
+    r"^arXiv:\S+\s+Announce Type:\s*\S+\s+Abstract:\s*",
+    re.IGNORECASE,
+)
+_ARXIV_ID_IN_ABS = re.compile(r"arxiv\.org/abs/([^?#\s]+)", re.IGNORECASE)
 
 TOKEN_PATTERN = re.compile(r"[a-z][a-z0-9+\-\.]{1,}")
 STOPWORDS = {
@@ -164,6 +171,7 @@ def _run_arxiv_call(func, *, description: str):
     for attempt in range(max_attempts):
         try:
             _wait_for_arxiv_request_slot()
+            _note_export_call()
             return func()
         except Exception as exc:
             last_exception = exc
@@ -271,6 +279,169 @@ def _raw_paper_categories(paper: RawPaper) -> list[str]:
     if not isinstance(values, list):
         return []
     return [str(value) for value in values if value]
+
+
+def _note_export_call() -> None:
+    global _export_call_count
+    _export_call_count += 1
+
+
+def _entry_value(entry: Any, key: str, default: Any = None) -> Any:
+    if isinstance(entry, dict):
+        return entry.get(key, default)
+    getter = getattr(entry, "get", None)
+    if callable(getter):
+        return getter(key, default)
+    return getattr(entry, key, default)
+
+
+def _rss_short_id(entry: Any) -> str:
+    raw = str(_entry_value(entry, "id", "") or "").strip()
+    if raw.startswith("oai:arXiv.org:"):
+        return raw.removeprefix("oai:arXiv.org:").strip()
+    match = _ARXIV_ID_IN_ABS.search(raw)
+    if match:
+        return match.group(1).strip()
+    link = str(_entry_value(entry, "link", "") or "")
+    match = _ARXIV_ID_IN_ABS.search(link)
+    if match:
+        return match.group(1).strip()
+    if raw and " " not in raw and not raw.startswith("http"):
+        return raw
+    return ""
+
+
+def _rss_authors(entry: Any) -> list[str]:
+    raw_names: list[str] = []
+    authors = _entry_value(entry, "authors", []) or []
+    if isinstance(authors, list):
+        for author in authors:
+            if isinstance(author, dict):
+                raw_names.append(str(author.get("name") or ""))
+            else:
+                raw_names.append(str(getattr(author, "name", author)))
+    if not raw_names:
+        author = _entry_value(entry, "author", "")
+        if author:
+            raw_names.append(str(author))
+    names: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_names:
+        parts = [part.strip() for part in str(raw).split(",")] if "," in str(raw) else [str(raw).strip()]
+        for part in parts:
+            key = part.lower()
+            if not part or key in seen:
+                continue
+            seen.add(key)
+            names.append(part)
+    return names
+
+
+def _rss_categories(entry: Any) -> tuple[str | None, list[str]]:
+    categories: list[str] = []
+    tags = _entry_value(entry, "tags", []) or []
+    if isinstance(tags, list):
+        for tag in tags:
+            if isinstance(tag, dict):
+                term = str(tag.get("term") or "").strip()
+            else:
+                term = str(getattr(tag, "term", "") or "").strip()
+            if term and term not in categories:
+                categories.append(term)
+    primary = categories[0] if categories else None
+    return primary, categories
+
+
+def _clean_rss_summary(summary: str) -> str:
+    text = str(summary or "").replace("\r\n", "\n").strip()
+    text = _RSS_ABSTRACT_PREFIX.sub("", text).strip()
+    text = re.split(r"\n(?:Journal-ref|DOI|Proxy|MSC classes)\s*:", text, maxsplit=1)[0].strip()
+    return text
+
+
+def _rss_published_iso(entry: Any) -> str | None:
+    """Announcement time from Atom <published>, not the feed <updated> stamp.
+
+    rss.arxiv.org sets <published> to midnight US/Eastern on the announcement
+    day. <updated> is the feed generation time and is nearly identical for
+    every entry, so it must not drive the business window or freshness score.
+    """
+    raw = _entry_value(entry, "published", None)
+    if not raw:
+        return None
+    try:
+        published = datetime.fromisoformat(str(raw).strip())
+    except ValueError:
+        return None
+    if published.tzinfo is None:
+        published = published.replace(tzinfo=timezone.utc)
+    return published.isoformat()
+
+
+def _rss_pdf_url(entry: Any, short_id: str) -> str | None:
+    links = _entry_value(entry, "links", []) or []
+    if isinstance(links, list):
+        for link in links:
+            if not isinstance(link, dict):
+                continue
+            href = str(link.get("href") or "")
+            title = str(link.get("title") or "").lower()
+            link_type = str(link.get("type") or "").lower()
+            if href and ("pdf" in title or "pdf" in link_type or "/pdf/" in href):
+                return href
+    if short_id:
+        return f"http://arxiv.org/pdf/{short_id}"
+    return None
+
+
+def _rss_code_url(entry: Any) -> str | None:
+    links = _entry_value(entry, "links", []) or []
+    if not isinstance(links, list):
+        return None
+    for link in links:
+        href = str(link.get("href") if isinstance(link, dict) else link)
+        if "github.com" in href:
+            return href
+    return None
+
+
+def _raw_paper_from_rss_entry(entry: Any) -> RawPaper | None:
+    short_id = _rss_short_id(entry)
+    if not short_id:
+        return None
+    primary_category, categories = _rss_categories(entry)
+    return {
+        "title": " ".join(str(_entry_value(entry, "title", "") or "").split()),
+        "authors": _rss_authors(entry),
+        "summary": _clean_rss_summary(str(_entry_value(entry, "summary", "") or "")),
+        "entry_id": f"http://arxiv.org/abs/{short_id}",
+        "pdf_url": _rss_pdf_url(entry, short_id),
+        "code_url": _rss_code_url(entry),
+        "published": _rss_published_iso(entry),
+        "primary_category": primary_category,
+        "categories": categories,
+        "announce_type": str(_entry_value(entry, "arxiv_announce_type", "") or "new"),
+        "retrieval_score": 0.0,
+        "lookback_score": 0.0,
+    }
+
+
+def _rss_paper_missing_critical_fields(paper: RawPaper | None) -> bool:
+    if paper is None:
+        return True
+    if not _paper_title(paper).strip():
+        return True
+    if not _paper_summary(paper).strip():
+        return True
+    if not _paper_entry_id(paper).strip():
+        return True
+    if not _raw_paper_authors(paper):
+        return True
+    if _paper_published(paper) is None:
+        return True
+    if not _raw_paper_primary_category(paper) and not _raw_paper_categories(paper):
+        return True
+    return False
 
 
 def _matches_category_policy(
@@ -486,11 +657,45 @@ class ArxivRetriever(BaseRetriever):
         self.business_date = _business_date(config)
         self._active_terms: list[str] = []
         self._negative_terms: list[str] = []
+        self._reset_retrieval_counters()
         if "arxiv_fetch_workers" in self.executor_config:
             logger.warning(
                 "executor.arxiv_fetch_workers is deprecated and ignored; "
                 "use executor.arxiv_id_batch_size to tune arXiv ID lookup batches"
             )
+
+    def _reset_retrieval_counters(self) -> None:
+        self.rss_calls = 0
+        self.id_fallback_count = 0
+        self._rss_announced = 0
+        self._rss_direct = 0
+        self._term_query_count = 0
+        self._lookback_rounds = 0
+        self._rss_seconds = 0.0
+        self._search_seconds = 0.0
+        self._rank_seconds = 0.0
+        self._semantic_seconds = 0.0
+        self._last_rank_stats: dict[str, int] = {}
+
+    def _publish_retrieval_stats(self, export_calls: int) -> None:
+        rank_stats = dict(self._last_rank_stats)
+        LAST_RETRIEVAL_STATS.clear()
+        LAST_RETRIEVAL_STATS.update(
+            {
+                "rss_seconds": round(self._rss_seconds, 3),
+                "search_seconds": round(self._search_seconds, 3),
+                "rank_seconds": round(self._rank_seconds, 3),
+                "semantic_seconds": round(self._semantic_seconds, 3),
+                "export_calls": export_calls,
+                "rss_calls": self.rss_calls,
+                "id_fallback_count": self.id_fallback_count,
+                "rss_announced": self._rss_announced,
+                "rss_direct": self._rss_direct,
+                "term_query_count": self._term_query_count,
+                "lookback_rounds": self._lookback_rounds,
+                **rank_stats,
+            }
+        )
 
     def _candidate_cache_key(
         self,
@@ -522,12 +727,17 @@ class ArxivRetriever(BaseRetriever):
         else:
             raise ValueError("arxiv category must be a string or list of strings")
 
-        if self.use_keyword_search:
-            logger.info("Using keyword-based search mode")
-            return self._keyword_based_retrieval(categories)
-        else:
+        global _export_call_count
+        export_started = _export_call_count
+        self._reset_retrieval_counters()
+        try:
+            if self.use_keyword_search:
+                logger.info("Using keyword-based search mode")
+                return self._keyword_based_retrieval(categories)
             logger.info("Using RSS feed search mode")
             return self._rss_based_retrieval(categories)
+        finally:
+            self._publish_retrieval_stats(_export_call_count - export_started)
 
     def _keyword_based_retrieval(self, categories: list[str]) -> list[RawPaper]:
         keywords: list[str] = []
@@ -567,6 +777,7 @@ class ArxivRetriever(BaseRetriever):
         end_days_ago = min(self.initial_recent_days * 2, self.max_recent_days)
 
         while start_days_ago < self.max_recent_days and start_days_ago < end_days_ago:
+            self._lookback_rounds += 1
             logger.info(
                 f"Top recommendations look weak, shifting arXiv lookback window to {start_days_ago}-{end_days_ago} days ago"
             )
@@ -663,26 +874,70 @@ class ArxivRetriever(BaseRetriever):
             return ranked
         return ranked[: self.keyword_corpus_limit]
 
-    def _fetch_rss_paper_ids(self, categories: list[str]) -> list[str]:
+    def _load_rss_entries(self, categories: list[str]) -> list[Any]:
         query = "+".join(categories)
-        include_cross = bool(get_config_value(self.config, "source.arxiv.include_cross_list"))
-
+        _wait_for_arxiv_request_slot()
+        self.rss_calls += 1
         feed = _FEEDPARSER.parse(f"https://rss.arxiv.org/atom/{query}")
-        if "Feed error for query" in feed.feed.get("title", ""):
+        title = ""
+        feed_meta = getattr(feed, "feed", None)
+        if isinstance(feed_meta, dict):
+            title = str(feed_meta.get("title", ""))
+        elif feed_meta is not None:
+            title = str(getattr(feed_meta, "get", lambda *_: "")("title", "") or "")
+        if "Feed error for query" in title:
             raise Exception(f"Invalid arxiv query: {query}")
+        return list(getattr(feed, "entries", []) or [])
 
+    def _fetch_rss_papers(self, categories: list[str]) -> list[RawPaper]:
+        entries = self._load_rss_entries(categories)
+        include_cross = bool(get_config_value(self.config, "source.arxiv.include_cross_list"))
         allowed_types = {"new", "cross"} if include_cross else {"new"}
-        paper_ids = [
-            entry.id.removeprefix("oai:arXiv.org:")
-            for entry in feed.entries
-            if entry.get("arxiv_announce_type", "new") in allowed_types
-        ]
+        papers: list[RawPaper] = []
+        fallback_ids: list[str] = []
+        seen_fallback: set[str] = set()
+        announced = 0
+        for entry in entries:
+            announce = str(_entry_value(entry, "arxiv_announce_type", "") or "new")
+            if announce not in allowed_types:
+                continue
+            announced += 1
+            paper = _raw_paper_from_rss_entry(entry)
+            if _rss_paper_missing_critical_fields(paper):
+                short_id = _rss_short_id(entry)
+                if short_id and short_id not in seen_fallback:
+                    seen_fallback.add(short_id)
+                    fallback_ids.append(short_id)
+                continue
+            papers.append(cast(RawPaper, paper))
 
         if bool(self.executor_config.get("debug", False)):
-            paper_ids = paper_ids[:10]
+            papers = papers[:10]
+            fallback_ids = fallback_ids[:10]
 
-        logger.info(f"Found {len(paper_ids)} paper IDs from arxiv RSS feed")
-        return paper_ids
+        direct_count = len(papers)
+        if fallback_ids:
+            self.id_fallback_count += len(fallback_ids)
+            logger.info(
+                f"RSS entries missing critical fields; ID lookup for {len(fallback_ids)} papers"
+            )
+            for result in self._fetch_papers_by_ids(fallback_ids):
+                papers.append(_to_raw_paper(result))
+
+        self._rss_announced += announced
+        self._rss_direct += direct_count
+        logger.info(
+            f"Parsed {direct_count} RSS papers directly "
+            f"({announced} announced, {len(fallback_ids)} ID fallbacks)"
+        )
+        return papers
+
+    def _fetch_rss_paper_ids(self, categories: list[str]) -> list[str]:
+        return [
+            _paper_entry_id(paper).rsplit("/", 1)[-1]
+            for paper in self._fetch_rss_papers(categories)
+            if _paper_entry_id(paper)
+        ]
 
     def _collect_candidate_pool(
         self,
@@ -708,9 +963,9 @@ class ArxivRetriever(BaseRetriever):
         )
 
         def _fetch_rss_candidates(_: str) -> tuple[str, list[ArxivResult | RawPaper]]:
-            _wait_for_arxiv_request_slot()
-            rss_paper_ids = self._fetch_rss_paper_ids(categories)
-            rss_papers = self._fetch_papers_by_ids(rss_paper_ids) if rss_paper_ids else []
+            started = time_module.perf_counter()
+            rss_papers = self._fetch_rss_papers(categories)
+            self._rss_seconds += time_module.perf_counter() - started
             return "rss", [
                 paper
                 for paper in rss_papers
@@ -722,11 +977,13 @@ class ArxivRetriever(BaseRetriever):
             ]
 
         def _fetch_recent_candidates(_: str) -> tuple[str, list[ArxivResult | RawPaper]]:
+            started = time_module.perf_counter()
             recent_papers: list[ArxivResult | RawPaper] = list(self._fetch_recent_category_papers(
                 categories,
                 start_days_ago=start_days_ago,
                 end_days_ago=end_days_ago,
             ))
+            self._search_seconds += time_module.perf_counter() - started
             return "recent", recent_papers
 
         source_labels = ["recent"]
@@ -781,6 +1038,7 @@ class ArxivRetriever(BaseRetriever):
         )
         include_cross = bool(get_config_value(self.config, "source.arxiv.include_cross_list"))
         term_queries = self._term_search_queries(self._active_terms)
+        self._term_query_count += len(term_queries)
         papers: list[RawPaper] = []
         if term_queries:
             per_query = min(
@@ -838,9 +1096,21 @@ class ArxivRetriever(BaseRetriever):
         logger.info(f"Fetched {len(papers)} recent papers from category search")
         return papers
 
+    def _term_clause(self, term: str) -> str:
+        if " " in term:
+            return f'abs:"{term}" OR ti:"{term}"'
+        return f"abs:{term} OR ti:{term}"
+
+    def _term_group_query(self, terms: list[str]) -> str:
+        return "(" + " OR ".join(self._term_clause(term) for term in terms) + ")"
+
     def _term_search_queries(self, terms: list[str]) -> list[str]:
-        group_size = max(1, int(get_config_value(self.config, "source.arxiv.keyword_query_group_size", 3)))
+        group_size = max(1, int(get_config_value(self.config, "source.arxiv.keyword_query_group_size", 6)))
         max_groups = max(1, int(get_config_value(self.config, "source.arxiv.keyword_query_max_groups", 3)))
+        max_chars = max(
+            1,
+            int(get_config_value(self.config, "source.arxiv.keyword_query_max_chars", 1100)),
+        )
         cleaned: list[str] = []
         seen: set[str] = set()
         for term in terms:
@@ -850,19 +1120,29 @@ class ArxivRetriever(BaseRetriever):
                 continue
             seen.add(key)
             cleaned.append(safe)
-        cleaned = cleaned[: group_size * max_groups]
-        queries = []
-        for start in range(0, len(cleaned), group_size):
-            parts = []
-            for term in cleaned[start : start + group_size]:
-                if " " in term:
-                    parts.append(f'abs:"{term}"')
-                    parts.append(f'ti:"{term}"')
-                else:
-                    parts.append(f"abs:{term}")
-                    parts.append(f"ti:{term}")
-            if parts:
-                queries.append("(" + " OR ".join(parts) + ")")
+        if self.max_keywords > 0:
+            cleaned = cleaned[: self.max_keywords]
+        if not cleaned:
+            return []
+
+        # Prefer the configured group size, but grow it so every term still fits
+        # in about max_groups requests. A group that would be too long is split
+        # instead of dropping the remaining terms.
+        target_size = max(group_size, math.ceil(len(cleaned) / max_groups))
+        queries: list[str] = []
+        index = 0
+        while index < len(cleaned):
+            size = min(target_size, len(cleaned) - index)
+            while size > 1 and len(self._term_group_query(cleaned[index : index + size])) > max_chars:
+                size -= 1
+            query = self._term_group_query(cleaned[index : index + size])
+            if len(query) > max_chars:
+                logger.warning(
+                    f"arXiv term query is {len(query)} chars, above the {max_chars} budget"
+                )
+            queries.append(query)
+            index += size
+        logger.info(f"Built {len(queries)} arXiv term queries covering {len(cleaned)} keywords")
         return queries
 
     def _search_arxiv(
@@ -930,7 +1210,24 @@ class ArxivRetriever(BaseRetriever):
     def _rank_candidate_pool(
         self, papers: list[RawPaper], keywords: list[str]
     ) -> list[RawPaper]:
+        started = time_module.perf_counter()
+        try:
+            return self._rank_candidate_pool_impl(papers, keywords)
+        finally:
+            self._rank_seconds += time_module.perf_counter() - started
+
+    def _rank_candidate_pool_impl(
+        self, papers: list[RawPaper], keywords: list[str]
+    ) -> list[RawPaper]:
         if not keywords or not papers:
+            self._last_rank_stats = {
+                "candidate_count": len(papers),
+                "semantic_input_count": 0,
+                "held_back_count": len(papers),
+                "matched_before_backfill": 0,
+                "backfilled": 0,
+                "final_count": 0,
+            }
             return []
 
         logger.info(
@@ -942,19 +1239,11 @@ class ArxivRetriever(BaseRetriever):
         use_bm25 = bool(get_config_value(self.config, "source.arxiv.use_bm25_scoring"))
         bm25_scores = _compute_bm25_scores(papers, keywords) if use_bm25 else {}
         bm25_scores = _normalize_scores(bm25_scores)
-        semantic_scores = self._semantic_scores(papers)
-        semantic_values = list(semantic_scores.values())
-        semantic_min = min(semantic_values) if semantic_values else 0.0
-        semantic_max = max(semantic_values) if semantic_values else 0.0
         semantic_mix = float(get_config_value(self.config, "source.arxiv.semantic_mix", 0.45))
         fallback_target = max(self.keyword_fallback_min_results, self.pre_rerank_limit)
-
-        def _semantic_norm(paper_id: str) -> float:
-            if not semantic_scores or semantic_max <= semantic_min:
-                return 0.0
-            return (semantic_scores.get(paper_id, semantic_min) - semantic_min) / (
-                semantic_max - semantic_min
-            )
+        prefilter_limit = int(
+            get_config_value(self.config, "source.arxiv.semantic_prefilter_limit", 300)
+        )
 
         def _recency_bonus(published: datetime | None) -> float:
             if published is None:
@@ -970,31 +1259,88 @@ class ArxivRetriever(BaseRetriever):
             )
             return float(math.exp(-age_days / self.recency_half_life_days))
 
-        scored_papers: list[tuple[float, float, float, float, float, RawPaper]] = []
-        seen_ids: set[str] = set()
+        # hybrid, match, bm25, match_count, recency, text_score, negative_penalty, paper
+        cheap_rows: list[tuple[float, float, float, float, float, float, float, RawPaper]] = []
         for paper in papers:
             match_score, match_count = _compute_keyword_match_score(paper, keywords)
-            paper_id = _paper_entry_id(paper)
-            bm25_score = bm25_scores.get(paper_id, 0.0)
-            semantic_norm = _semantic_norm(paper_id)
+            bm25_score = bm25_scores.get(_paper_entry_id(paper), 0.0)
             negative_score, negative_count = (
                 _compute_keyword_match_score(paper, self._negative_terms)
                 if self._negative_terms
                 else (0.0, 0.0)
             )
-
-            published = _paper_published(paper)
-            recency_bonus = _recency_bonus(published)
-
+            recency_bonus = _recency_bonus(_paper_published(paper))
             text_score = match_score + bm25_score * 4.0
+            negative_penalty = (
+                min(negative_score, 4.0) if negative_count and match_count == 0 else 0.0
+            )
+            cheap_hybrid = text_score - negative_penalty + recency_bonus * 0.75
+            cheap_rows.append(
+                (
+                    cheap_hybrid,
+                    match_score,
+                    bm25_score,
+                    match_count,
+                    recency_bonus,
+                    text_score,
+                    negative_penalty,
+                    paper,
+                )
+            )
+        cheap_rows.sort(key=lambda row: (-row[0], -row[1], -row[2], -row[3]))
+
+        selected_rows: list[tuple[float, float, float, float, float, float, float, RawPaper]] = []
+        seen_cheap: set[str] = set()
+        limit = len(cheap_rows) if prefilter_limit <= 0 else prefilter_limit
+        for row in cheap_rows:
+            paper_id = _paper_entry_id(row[-1])
+            if paper_id in seen_cheap:
+                continue
+            seen_cheap.add(paper_id)
+            selected_rows.append(row)
+            if len(selected_rows) >= limit:
+                break
+        selected_papers = [row[-1] for row in selected_rows]
+        logger.info(
+            f"Cheap prefilter selected {len(selected_papers)} of {len(papers)} candidates "
+            f"for embeddings (limit={prefilter_limit})"
+        )
+
+        semantic_started = time_module.perf_counter()
+        semantic_scores = self._semantic_scores(selected_papers)
+        self._semantic_seconds += time_module.perf_counter() - semantic_started
+        semantic_values = list(semantic_scores.values())
+        semantic_min = min(semantic_values) if semantic_values else 0.0
+        semantic_max = max(semantic_values) if semantic_values else 0.0
+
+        def _semantic_norm(paper_id: str) -> float:
+            if not semantic_scores or semantic_max <= semantic_min:
+                return 0.0
+            return (semantic_scores.get(paper_id, semantic_min) - semantic_min) / (
+                semantic_max - semantic_min
+            )
+
+        scored_papers: list[tuple[float, float, float, float, float, RawPaper]] = []
+        seen_ids: set[str] = set()
+        for (
+            _cheap_hybrid,
+            match_score,
+            bm25_score,
+            match_count,
+            recency_bonus,
+            text_score,
+            negative_penalty,
+            paper,
+        ) in selected_rows:
+            paper_id = _paper_entry_id(paper)
+            semantic_norm = _semantic_norm(paper_id)
             if semantic_scores:
                 retrieval_score = (1.0 - semantic_mix) * text_score + semantic_mix * (
                     semantic_norm * 4.0
                 )
             else:
                 retrieval_score = text_score
-            if negative_count and match_count == 0:
-                retrieval_score -= min(negative_score, 4.0)
+            retrieval_score -= negative_penalty
             hybrid_score = retrieval_score + recency_bonus * 0.75
             lookback_score = hybrid_score * (1.0 + min(match_count, 3.0))
             if match_count >= min_match_count or hybrid_score >= 1.5 or semantic_norm >= 0.72:
@@ -1014,6 +1360,7 @@ class ArxivRetriever(BaseRetriever):
         scored_papers.sort(key=lambda x: (-x[0], -x[1], -x[2], -x[3]))
 
         matched_papers = [p for *_, p in scored_papers]
+        matched_before_backfill = len(matched_papers)
 
         fallback_scored: list[tuple[float, float, float, RawPaper]] = []
         for paper in papers:
@@ -1033,11 +1380,13 @@ class ArxivRetriever(BaseRetriever):
 
         fallback_scored.sort(key=lambda item: (-item[0], -item[1], -item[2]))
 
+        backfilled_count = 0
         if not matched_papers:
             logger.warning(
                 "Keyword ranking yielded no matches, falling back to BM25/recency ranking"
             )
             matched_papers = [paper for *_, paper in fallback_scored[:fallback_target]]
+            backfilled_count = len(matched_papers)
         elif len(matched_papers) < fallback_target:
             existing_ids = {_paper_entry_id(paper) for paper in matched_papers}
             backfilled = list(matched_papers)
@@ -1049,18 +1398,33 @@ class ArxivRetriever(BaseRetriever):
                 backfilled.append(paper)
                 if len(backfilled) >= fallback_target:
                     break
-            if len(backfilled) > len(matched_papers):
+            backfilled_count = len(backfilled) - len(matched_papers)
+            if backfilled_count:
                 logger.info(
-                    f"Backfilled {len(backfilled) - len(matched_papers)} additional BM25/recency papers"
+                    f"Backfilled {backfilled_count} additional BM25/recency papers"
                 )
             matched_papers = backfilled
 
         if len(matched_papers) > self.pre_rerank_limit > 0:
             matched_papers = matched_papers[: self.pre_rerank_limit]
 
+        semantic_ids = {_paper_entry_id(paper) for paper in selected_papers}
+        tail_kept = sum(
+            1 for paper in matched_papers if _paper_entry_id(paper) not in semantic_ids
+        )
+        self._last_rank_stats = {
+            "candidate_count": len(papers),
+            "semantic_input_count": len(selected_papers),
+            "held_back_count": max(len(papers) - len(selected_papers), 0),
+            "matched_before_backfill": matched_before_backfill,
+            "backfilled": backfilled_count,
+            "tail_kept": tail_kept,
+            "final_count": len(matched_papers),
+        }
         logger.info(
             f"Found {len(matched_papers)} papers matching keywords "
-            f"(min_matches={min_match_count}, bm25={use_bm25})"
+            f"(min_matches={min_match_count}, bm25={use_bm25}, "
+            f"semantic_pool={len(selected_papers)}, held_back={self._last_rank_stats['held_back_count']})"
         )
         if matched_papers and logger.level("DEBUG").no >= logger.level("INFO").no:
             logger.info("Top matches:")

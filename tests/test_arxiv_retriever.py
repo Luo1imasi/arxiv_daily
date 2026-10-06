@@ -17,11 +17,46 @@ from arxiv_daily.retriever.arxiv_retriever import (
     _looks_like_oversized_arxiv_request,
     _matches_category_policy,
     _published_in_window,
+    _raw_paper_from_rss_entry,
 )
 
 
 def _raw_paper(**values: object) -> RawPaper:
     return dict(values)
+
+
+def _rss_entry(
+    short_id: str,
+    title: str,
+    abstract: str,
+    *,
+    published: str,
+    updated: str = "2026-04-24T12:00:00+00:00",
+    announce: str = "new",
+    pdf_href: str | None = None,
+) -> dict[str, object]:
+    links: list[dict[str, str]] = [
+        {
+            "href": f"https://arxiv.org/abs/{short_id.split('v')[0]}",
+            "rel": "alternate",
+            "type": "text/html",
+        }
+    ]
+    if pdf_href:
+        links.append({"href": pdf_href, "rel": "related", "type": "application/pdf", "title": "pdf"})
+    summary = f"arXiv:{short_id} Announce Type: {announce} \nAbstract: {abstract}" if abstract else ""
+    return {
+        "id": f"oai:arXiv.org:{short_id}",
+        "title": title,
+        "summary": summary,
+        "author": "Ada Lovelace, Alan Turing",
+        "authors": [{"name": "Ada Lovelace, Alan Turing"}],
+        "published": published,
+        "updated": updated,
+        "arxiv_announce_type": announce,
+        "tags": [{"term": "cs.AI"}, {"term": "cs.LG"}],
+        "links": links,
+    }
 
 
 class StubArxivRetriever(ArxivRetriever):
@@ -248,34 +283,56 @@ class AdaptiveLookbackTests(unittest.TestCase):
             },
         }
         retriever = ArxivRetriever(config)
-        current_paper = _raw_paper(
-            title="Current paper",
-            authors=[],
-            summary="Current abstract",
-            entry_id="https://arxiv.org/abs/current",
-            pdf_url=None,
-            code_url=None,
-            published=datetime(2026, 4, 22, 12, tzinfo=timezone.utc).isoformat(),
-        )
-        future_paper = _raw_paper(
-            title="Future paper",
-            authors=[],
-            summary="Future abstract",
-            entry_id="https://arxiv.org/abs/future",
-            pdf_url=None,
-            code_url=None,
-            published=datetime(2026, 4, 24, 12, tzinfo=timezone.utc).isoformat(),
-        )
+        old_data_dir = os.environ.get("ARXIV_DAILY_DATA")
+        os.environ["ARXIV_DAILY_DATA"] = tempfile.mkdtemp()
+        asyncio.run(db.init_db())
+        entries = [
+            _rss_entry(
+                "2604.00001v1",
+                "Current paper",
+                "Current abstract",
+                published="2026-04-22T00:00:00-04:00",
+                updated="2026-04-24T12:00:00+00:00",
+            ),
+            _rss_entry(
+                "2604.00002v1",
+                "Future paper",
+                "Future abstract",
+                published="2026-04-24T00:00:00-04:00",
+                updated="2026-04-22T12:00:00+00:00",
+            ),
+            _rss_entry(
+                "2604.00003v1",
+                "Cross paper",
+                "Cross abstract",
+                published="2026-04-22T00:00:00-04:00",
+                announce="cross",
+            ),
+        ]
+        id_calls: list[list[str]] = []
 
-        retriever._fetch_rss_paper_ids = lambda categories: ["current", "future"]
-        retriever._fetch_papers_by_ids = lambda paper_ids: cast(
-            Any, [current_paper, future_paper]
-        )
+        retriever._load_rss_entries = lambda categories: entries
+        retriever._fetch_papers_by_ids = lambda paper_ids: id_calls.append(list(paper_ids)) or []
         retriever._fetch_recent_category_papers = lambda *args, **kwargs: []
 
-        papers = retriever._collect_candidate_pool(["cs.AI"])
+        try:
+            papers = retriever._collect_candidate_pool(["cs.AI"])
+        finally:
+            if old_data_dir is None:
+                os.environ.pop("ARXIV_DAILY_DATA", None)
+            else:
+                os.environ["ARXIV_DAILY_DATA"] = old_data_dir
 
-        self.assertEqual([paper["entry_id"] for paper in papers], ["https://arxiv.org/abs/current"])
+        self.assertEqual(id_calls, [])
+        self.assertEqual([paper["entry_id"] for paper in papers], ["http://arxiv.org/abs/2604.00001v1"])
+        kept = papers[0]
+        self.assertEqual(kept["summary"], "Current abstract")
+        self.assertEqual(kept["authors"], ["Ada Lovelace", "Alan Turing"])
+        self.assertEqual(kept["pdf_url"], "http://arxiv.org/pdf/2604.00001v1")
+        self.assertEqual(kept["primary_category"], "cs.AI")
+        self.assertEqual(kept["categories"], ["cs.AI", "cs.LG"])
+        self.assertEqual(kept["announce_type"], "new")
+        self.assertEqual(kept["published"], "2026-04-22T00:00:00-04:00")
 
     def test_recent_category_query_uses_submitted_date_window_and_cross_filter(self):
         config = {
@@ -441,7 +498,7 @@ class AdaptiveLookbackTests(unittest.TestCase):
                     calls["recent"] += 1
                     return []
 
-                retriever._fetch_rss_paper_ids = lambda categories: []
+                retriever._load_rss_entries = lambda categories: []
                 retriever._fetch_recent_category_papers = fake_recent
 
                 first = retriever._collect_candidate_pool(["cs.AI"])
@@ -694,6 +751,286 @@ class TermQueryTests(unittest.TestCase):
         termed = retriever._candidate_cache_key(["cs.AI"], start_days_ago=0, end_days_ago=1)
 
         self.assertNotEqual(plain, termed)
+
+    def test_all_canonical_terms_fit_without_dropping_or_oversized_queries(self):
+        terms = [
+            "humanoid whole-body control",
+            "legged locomotion",
+            "perceptive locomotion",
+            "loco-manipulation",
+            "motion tracking",
+            "motion retargeting",
+            "adversarial motion prior",
+            "physics-based character control",
+            "sim-to-real",
+            "reinforcement learning",
+            "diffusion policy",
+            "model predictive control",
+        ]
+        retriever = ArxivRetriever(
+            {
+                "source": {
+                    "arxiv": {
+                        "category": ["cs.AI"],
+                        "max_keywords": 20,
+                        "keyword_query_group_size": 3,
+                        "keyword_query_max_groups": 3,
+                        "keyword_query_max_chars": 1100,
+                    }
+                }
+            }
+        )
+
+        queries = retriever._term_search_queries(terms)
+
+        self.assertLessEqual(len(queries), 3)
+        self.assertGreaterEqual(len(queries), 1)
+        blob = " ".join(queries)
+        for term in terms:
+            if " " in term:
+                self.assertIn(f'abs:"{term}"', blob)
+                self.assertIn(f'ti:"{term}"', blob)
+            else:
+                self.assertIn(f"abs:{term}", blob)
+                self.assertIn(f"ti:{term}", blob)
+        for query in queries:
+            self.assertLessEqual(len(query), 1100)
+            self.assertNotIn("cat:", query)
+
+    def test_max_keywords_still_limits_term_queries(self):
+        retriever = ArxivRetriever(
+            {
+                "source": {
+                    "arxiv": {
+                        "category": ["cs.AI"],
+                        "max_keywords": 2,
+                        "keyword_query_group_size": 3,
+                        "keyword_query_max_groups": 3,
+                    }
+                }
+            }
+        )
+
+        queries = retriever._term_search_queries(
+            ["alpha beta", "gamma delta", "epsilon zeta"]
+        )
+
+        self.assertEqual(len(queries), 1)
+        self.assertIn('abs:"alpha beta"', queries[0])
+        self.assertIn('abs:"gamma delta"', queries[0])
+        self.assertNotIn("epsilon", queries[0])
+
+    def test_long_terms_split_before_the_query_budget(self):
+        terms = [
+            "alpha bravo charlie delta echo",
+            "foxtrot golf hotel india juliet",
+            "kilo lima mike november oscar",
+        ]
+        retriever = ArxivRetriever(
+            {
+                "source": {
+                    "arxiv": {
+                        "category": ["cs.AI"],
+                        "max_keywords": 10,
+                        "keyword_query_group_size": 6,
+                        "keyword_query_max_groups": 1,
+                        "keyword_query_max_chars": 120,
+                    }
+                }
+            }
+        )
+
+        queries = retriever._term_search_queries(terms)
+
+        self.assertEqual(len(queries), 3)
+        blob = " ".join(queries)
+        for term in terms:
+            self.assertIn(f'abs:"{term}"', blob)
+        for query in queries:
+            self.assertLessEqual(len(query), 120)
+
+
+class RssEntryParsingTests(unittest.TestCase):
+    def test_parser_uses_announcement_published_and_splits_authors(self):
+        paper = _raw_paper_from_rss_entry(
+            _rss_entry(
+                "2610.03872v1",
+                "Training Numerical Intelligence",
+                "AI agents improve solvers.",
+                published="2026-10-06T00:00:00-04:00",
+                updated="2026-10-06T04:10:29+00:00",
+                pdf_href="https://arxiv.org/pdf/2610.03872",
+            )
+        )
+
+        self.assertIsNotNone(paper)
+        assert paper is not None
+        self.assertEqual(paper["entry_id"], "http://arxiv.org/abs/2610.03872v1")
+        self.assertEqual(paper["published"], "2026-10-06T00:00:00-04:00")
+        self.assertNotEqual(paper["published"], "2026-10-06T04:10:29+00:00")
+        self.assertEqual(paper["summary"], "AI agents improve solvers.")
+        self.assertEqual(paper["authors"], ["Ada Lovelace", "Alan Turing"])
+        self.assertEqual(paper["pdf_url"], "https://arxiv.org/pdf/2610.03872")
+        self.assertEqual(paper["announce_type"], "new")
+        published = datetime.fromisoformat(str(paper["published"]))
+        window_start = datetime(2026, 10, 5, 16, tzinfo=timezone.utc)
+        window_end = datetime(2026, 10, 6, 16, tzinfo=timezone.utc)
+        self.assertTrue(_published_in_window(published, window_start, window_end))
+
+    def test_incomplete_rss_entry_falls_back_to_id_lookup(self):
+        config = {
+            "executor": {"business_date": "2026-04-22", "timezone": "UTC"},
+            "source": {
+                "arxiv": {
+                    "category": ["cs.AI"],
+                    "recent_days": 1,
+                }
+            },
+        }
+        retriever = ArxivRetriever(config)
+        old_data_dir = os.environ.get("ARXIV_DAILY_DATA")
+        os.environ["ARXIV_DAILY_DATA"] = tempfile.mkdtemp()
+        asyncio.run(db.init_db())
+        complete = _rss_entry(
+            "2604.10001v1",
+            "Complete paper",
+            "Complete abstract",
+            published="2026-04-22T00:00:00-04:00",
+        )
+        incomplete = _rss_entry(
+            "2604.10002v1",
+            "Missing abstract",
+            "",
+            published="2026-04-22T00:00:00-04:00",
+        )
+        incomplete["summary"] = ""
+        looked_up: list[list[str]] = []
+
+        def fake_lookup(paper_ids: list[str]) -> list[RawPaper]:
+            looked_up.append(list(paper_ids))
+            return [
+                _raw_paper(
+                    title="Missing abstract",
+                    authors=["Grace Hopper"],
+                    summary="Recovered abstract",
+                    entry_id="http://arxiv.org/abs/2604.10002v1",
+                    pdf_url="http://arxiv.org/pdf/2604.10002v1",
+                    published="2026-04-22T18:00:00+00:00",
+                    primary_category="cs.AI",
+                    categories=["cs.AI"],
+                )
+            ]
+
+        retriever._load_rss_entries = lambda categories: [complete, incomplete]
+        retriever._fetch_papers_by_ids = fake_lookup
+        retriever._fetch_recent_category_papers = lambda *args, **kwargs: []
+
+        try:
+            papers = retriever._collect_candidate_pool(["cs.AI"])
+        finally:
+            if old_data_dir is None:
+                os.environ.pop("ARXIV_DAILY_DATA", None)
+            else:
+                os.environ["ARXIV_DAILY_DATA"] = old_data_dir
+
+        self.assertEqual(looked_up, [["2604.10002v1"]])
+        by_id = {paper["entry_id"]: paper for paper in papers}
+        self.assertEqual(by_id["http://arxiv.org/abs/2604.10001v1"]["summary"], "Complete abstract")
+        self.assertEqual(by_id["http://arxiv.org/abs/2604.10002v1"]["summary"], "Recovered abstract")
+        self.assertEqual(retriever.id_fallback_count, 1)
+
+
+class SemanticPrefilterTests(unittest.TestCase):
+    def _retriever(self, **arxiv: object) -> ArxivRetriever:
+        source = {
+            "category": ["cs.AI"],
+            "use_bm25_scoring": False,
+            "min_keyword_matches": 1,
+            "semantic_prefilter_limit": 2,
+            "pre_rerank_limit": 10,
+            "keyword_fallback_min_results": 10,
+            "recency_half_life_days": 14,
+        }
+        source.update(arxiv)
+        retriever = ArxivRetriever(
+            {
+                "executor": {"business_date": "2026-04-22", "timezone": "UTC"},
+                "source": {"arxiv": source},
+            }
+        )
+        retriever._semantic_inputs = []
+
+        def _semantic(papers: list[RawPaper]) -> dict[str, float]:
+            retriever._semantic_inputs.append([str(paper["entry_id"]) for paper in papers])
+            return {}
+
+        retriever._semantic_scores = _semantic  # type: ignore[method-assign]
+        return retriever
+
+    def test_embeddings_run_only_for_the_cheap_top_slice(self):
+        retriever = self._retriever()
+        papers = [
+            _raw_paper(
+                entry_id="p1",
+                title="alpha beta gamma delta epsilon",
+                summary="robot",
+                published="2026-04-22T12:00:00+00:00",
+            ),
+            _raw_paper(
+                entry_id="p2",
+                title="alpha beta gamma delta",
+                summary="robot",
+                published="2026-04-22T12:00:00+00:00",
+            ),
+            _raw_paper(
+                entry_id="p3",
+                title="alpha only",
+                summary="robot",
+                published="2026-04-22T12:00:00+00:00",
+            ),
+            _raw_paper(
+                entry_id="p4",
+                title="unrelated topic",
+                summary="nothing",
+                published="2026-04-22T12:00:00+00:00",
+            ),
+        ]
+
+        ranked = retriever._rank_candidate_pool(
+            papers, ["alpha", "beta", "gamma", "delta", "epsilon"]
+        )
+
+        self.assertEqual(retriever._semantic_inputs, [["p1", "p2"]])
+        self.assertEqual(
+            [paper["entry_id"] for paper in ranked],
+            ["p1", "p2", "p3", "p4"],
+        )
+        self.assertEqual(retriever._last_rank_stats["candidate_count"], 4)
+        self.assertEqual(retriever._last_rank_stats["semantic_input_count"], 2)
+        self.assertEqual(retriever._last_rank_stats["held_back_count"], 2)
+        self.assertEqual(retriever._last_rank_stats["tail_kept"], 2)
+
+    def test_pre_rerank_limit_stays_in_place_after_prefilter(self):
+        retriever = self._retriever(
+            semantic_prefilter_limit=2,
+            pre_rerank_limit=2,
+            keyword_fallback_min_results=2,
+        )
+        papers = [
+            _raw_paper(
+                entry_id=f"p{day}",
+                title="alpha locomotion",
+                summary="alpha",
+                published=f"2026-04-{day:02d}T12:00:00+00:00",
+            )
+            for day in (22, 21, 20, 19)
+        ]
+
+        ranked = retriever._rank_candidate_pool(papers, ["alpha"])
+
+        self.assertEqual([paper["entry_id"] for paper in ranked], ["p22", "p21"])
+        self.assertEqual(retriever._semantic_inputs, [["p22", "p21"]])
+        self.assertEqual(retriever._last_rank_stats["final_count"], 2)
 
 
 class LocalKeywordExtractionTests(unittest.TestCase):

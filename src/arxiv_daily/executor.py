@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import threading
+import time
 import concurrent.futures
 from datetime import date, datetime
 from loguru import logger
@@ -571,7 +572,15 @@ class Executor:
 
     async def run(self, skip_tldr: bool = False) -> list[Paper]:
         business_date = _get_business_date(self.config)
+        stage_seconds: dict[str, float] = {}
+
+        def _finish_stage(name: str, started: float) -> None:
+            stage_seconds[name] = round(time.perf_counter() - started, 3)
+            self.last_run_metrics["stage_seconds"] = dict(stage_seconds)
+
+        stage_started = time.perf_counter()
         corpus = await self.fetch_corpus()
+        _finish_stage("corpus", stage_started)
         self.last_run_metrics.update(
             {
                 "status": "running",
@@ -609,7 +618,9 @@ class Executor:
                 note_llm_error(llm_message)
         elif not skip_tldr and not self.config.get("llm", {}).get("api_key"):
             note_llm_warning("未配置 LLM API key，已跳过画像、裁判和 TLDR")
+        stage_started = time.perf_counter()
         profile = await _ensure_interest_profile(self.config, corpus, llm_ready=llm_ready)
+        _finish_stage("profile", stage_started)
         retrieval_config = copy.deepcopy(self.config)
         if profile:
             retrieval_config["interest_profile"] = profile
@@ -623,7 +634,12 @@ class Executor:
             )
             return source, papers
 
+        stage_started = time.perf_counter()
         source_results = await asyncio.gather(*[_retrieve_source(source) for source in sources])
+        _finish_stage("retrieve", stage_started)
+        from .retriever.arxiv_retriever import LAST_RETRIEVAL_STATS
+
+        self.last_run_metrics["retrieval_stats"] = dict(LAST_RETRIEVAL_STATS)
 
         all_papers = []
         for source, papers in source_results:
@@ -663,9 +679,11 @@ class Executor:
 
         logger.info("Reranking with local reranker...")
         reranker = get_reranker_cls("local")(self.config)
+        stage_started = time.perf_counter()
         reranked = await loop.run_in_executor(
             get_executor_pool(self.config), lambda: reranker.rerank(all_papers, corpus)
         )
+        _finish_stage("rerank", stage_started)
         self.last_run_metrics["reranked_candidates"] = len(reranked)
         max_num = int(get_config_value(self.config, "executor.max_paper_num"))
 
@@ -673,12 +691,16 @@ class Executor:
             self.last_run_metrics.update(
                 _default_llm_metrics(enabled=True, target_count=min(len(reranked), max_num))
             )
+            stage_started = time.perf_counter()
             reranked = await _apply_judge(
                 reranked, profile, self.config, self.last_run_metrics
             )
+            _finish_stage("judge", stage_started)
+            stage_started = time.perf_counter()
             await _apply_tldr_enrichment(
                 reranked, self.config, self.last_run_metrics, profile
             )
+            _finish_stage("tldr", stage_started)
         else:
             reranked = reranked[:max_num]
             self.last_run_metrics.update(

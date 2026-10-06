@@ -16,9 +16,11 @@ source:
     candidate_cache_ttl_minutes: 180
     keyword_fallback_min_results: 20
     keyword_query_max_groups: 3
-    keyword_query_group_size: 3
+    keyword_query_group_size: 6
+    keyword_query_max_chars: 1100
     keyword_query_max_results: 80
     semantic_mix: 0.45
+    semantic_prefilter_limit: 300
     pre_rerank_limit: 120
     use_bm25_scoring: true
     min_keyword_matches: 1
