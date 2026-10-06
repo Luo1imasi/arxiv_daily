@@ -176,11 +176,16 @@ class LocalReranker(BaseReranker):
         )
 
         max_paper_num = max(1, int(get_config_value(self.config, "executor.max_paper_num")))
+        judge_pool = int(get_config_value(self.config, "executor.judge_pool_size", 24))
+        judge_pool = min(30, max(20, judge_pool, min(max_paper_num, 30)))
         pre_mmr_factor = max(
             1,
             int(get_config_value(self.config, "reranker.pre_mmr_candidate_factor")),
         )
-        pre_mmr_limit = min(len(candidates), max(max_paper_num * pre_mmr_factor, max_paper_num))
+        pre_mmr_limit = min(
+            len(candidates),
+            max(max_paper_num * pre_mmr_factor, judge_pool, max_paper_num),
+        )
         if pre_mmr_limit < len(candidates):
             selected_indices = np.argsort(-base_scores)[:pre_mmr_limit]
             selected_indices = selected_indices.tolist()
@@ -189,7 +194,8 @@ class LocalReranker(BaseReranker):
             base_scores = base_scores[selected_indices]
 
         candidate_sim = candidate_features @ candidate_features.T
-        order, mmr_scores = self._mmr_order(base_scores, candidate_sim, max_paper_num)
+        mmr_target = min(len(candidates), max(judge_pool, max_paper_num))
+        order, mmr_scores = self._mmr_order(base_scores, candidate_sim, mmr_target)
 
         reranked = [candidates[i] for i in order]
         display_scores = _display_scores(mmr_scores)
@@ -256,19 +262,29 @@ class LocalReranker(BaseReranker):
         else:
             uncached_features = np.zeros((0, 0), dtype=np.float32)
 
-        item_features = [None] * len(items)
+        item_features: list[np.ndarray | None] = [None] * len(items)
         for i, emb in zip(cached_indices, cached_embeddings):
-            item_features[i] = np.asarray(emb, dtype=np.float32)
+            if 0 <= i < len(items):
+                item_features[i] = np.asarray(emb, dtype=np.float32).reshape(-1)
         for i, emb in zip(uncached_indices, uncached_features):
-            item_features[i] = np.asarray(emb, dtype=np.float32)
+            if 0 <= i < len(items):
+                item_features[i] = np.asarray(emb, dtype=np.float32).reshape(-1)
 
-        valid_features = [feature for feature in item_features if feature is not None]
-        if len(valid_features) != len(item_features):
-            missing = len(item_features) - len(valid_features)
-            logger.warning(f"Missing embeddings for {missing} {log_prefix} papers, dropping them")
-        if not valid_features:
+        known = next((feature for feature in item_features if feature is not None), None)
+        if known is None:
             raise ValueError(f"No {log_prefix} embeddings available after cache/encoding")
-        return _normalize_rows(_to_numpy(valid_features))
+        missing = sum(feature is None for feature in item_features)
+        if missing:
+            logger.warning(
+                f"Missing embeddings for {missing} {log_prefix} papers; "
+                "keeping row alignment with zero vectors"
+            )
+            width = int(known.shape[0])
+            item_features = [
+                feature if feature is not None else np.zeros(width, dtype=np.float32)
+                for feature in item_features
+            ]
+        return _normalize_rows(_to_numpy(item_features))
 
     def _get_recency_score(self, published_date: str | None) -> float:
         if not published_date:
@@ -352,3 +368,113 @@ class LocalReranker(BaseReranker):
             encode_kwargs,
         )
         return candidate_features @ corpus_features.T
+
+
+def _embedding_cache_key(config: dict) -> tuple[str, dict, str]:
+    model_name = get_config_value(config, "reranker.model")
+    encode_kwargs = dict(get_config_value(config, "reranker.encode_kwargs"))
+    embedding_cache_key = (
+        f"{model_name}|{json.dumps(encode_kwargs, sort_keys=True, ensure_ascii=True)}"
+    )
+    return model_name, encode_kwargs, embedding_cache_key
+
+
+def _as_feature_items(items: list) -> list:
+    prepared = []
+    for item in items:
+        if isinstance(item, dict):
+            prepared.append(
+                type(
+                    "FeatureItem",
+                    (),
+                    {
+                        "title": str(item.get("title") or ""),
+                        "abstract": str(item.get("summary") or item.get("abstract") or ""),
+                    },
+                )()
+            )
+        else:
+            prepared.append(item)
+    return prepared
+
+
+def _centroid_similarity(candidate_features: np.ndarray, corpus_features: np.ndarray) -> np.ndarray:
+    centroid = corpus_features.mean(axis=0)
+    norm = float(np.linalg.norm(centroid))
+    if norm == 0:
+        return np.zeros(candidate_features.shape[0], dtype=np.float32)
+    centroid = centroid / norm
+    return candidate_features @ centroid
+
+
+def semantic_scores_for_raw_papers(
+    config: dict,
+    papers: list,
+    corpus: list,
+    query_text: str | None = None,
+) -> dict[str, float]:
+    """Cosine similarity of each candidate to the corpus centroid and an optional query."""
+    if not papers or not corpus:
+        return {}
+    model_name, encode_kwargs, embedding_cache_key = _embedding_cache_key(config)
+    encoder = _get_encoder(model_name)
+    reranker = LocalReranker(config)
+    candidate_items = _as_feature_items(papers)
+    candidate_texts = [f"{item.title}\n{item.abstract}" for item in candidate_items]
+    corpus_texts = [f"{item.title}\n{getattr(item, 'abstract', '') or ''}" for item in corpus]
+    candidate_features = reranker._get_item_features(
+        encoder,
+        candidate_items,
+        candidate_texts,
+        embedding_cache_key,
+        encode_kwargs,
+        log_prefix="coarse-candidate",
+    )
+    corpus_features = reranker._get_corpus_features(
+        encoder,
+        corpus,
+        corpus_texts,
+        embedding_cache_key,
+        encode_kwargs,
+    )
+    semantic = _centroid_similarity(candidate_features, corpus_features)
+    if query_text:
+        query_kwargs = dict(encode_kwargs)
+        query_kwargs["prompt_name"] = "query"
+        query_vector = _normalize_rows(
+            _to_numpy(encoder.encode([query_text], **query_kwargs, show_progress_bar=False))
+        )[0]
+        query_similarity = candidate_features @ query_vector
+        semantic = 0.65 * semantic + 0.35 * query_similarity
+    scores: dict[str, float] = {}
+    for paper, score in zip(papers, semantic):
+        paper_id = str(paper.get("entry_id") if isinstance(paper, dict) else getattr(paper, "url", ""))
+        if paper_id:
+            scores[paper_id] = float(score)
+    return scores
+
+
+def rank_items_by_query(config: dict, query: str, items: list, top_k: int = 8) -> list[tuple[int, float]]:
+    if not query.strip() or not items:
+        return []
+    model_name, encode_kwargs, embedding_cache_key = _embedding_cache_key(config)
+    encoder = _get_encoder(model_name)
+    reranker = LocalReranker(config)
+    feature_items = _as_feature_items(items)
+    texts = [f"{item.title}\n{item.abstract}" for item in feature_items]
+    features = reranker._get_item_features(
+        encoder,
+        feature_items,
+        texts,
+        embedding_cache_key,
+        encode_kwargs,
+        log_prefix="qa",
+    )
+    query_kwargs = dict(encode_kwargs)
+    query_kwargs["prompt_name"] = "query"
+    query_vector = _normalize_rows(
+        _to_numpy(encoder.encode([query], **query_kwargs, show_progress_bar=False))
+    )[0]
+    similarities = features @ query_vector
+    order = np.argsort(-similarities)[: max(1, top_k)]
+    return [(int(index), float(similarities[index])) for index in order]

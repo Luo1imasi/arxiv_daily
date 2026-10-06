@@ -12,7 +12,13 @@ class Paper:
     pdf_url: str | None = None
     code_url: str | None = None
     tldr: str | None = None
+    method: str | None = None
+    evidence: str | None = None
+    why_for_me: str | None = None
     score: float | None = None
+    judge_relevance: float | None = None
+    judge_reason: str | None = None
+    judge_keep: bool | None = None
     retrieval_score: float | None = None
     date: str | None = None
 

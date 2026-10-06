@@ -1,5 +1,9 @@
 import os
 import asyncio
+import copy
+import hashlib
+import json
+import threading
 import concurrent.futures
 from datetime import date, datetime
 from loguru import logger
@@ -11,7 +15,19 @@ from .protocol import CorpusPaper, Paper
 from .webdav import fetch_corpus
 from .retriever import get_retriever_cls
 from .reranker import get_reranker_cls
-from .llm import generate_tldr
+from .llm import (
+    PROMPT_VERSIONS,
+    build_interest_profile,
+    check_connectivity,
+    generate_tldrs_batch,
+    get_llm_usage,
+    judge_papers,
+    make_llm_cache_key,
+    note_llm_error,
+    note_llm_warning,
+    reset_llm_usage,
+    resolve_model,
+)
 from . import database as db
 from .config import get_config_value
 from .utils import make_content_key
@@ -23,22 +39,34 @@ from .business_date import (
     normalize_business_date as _normalize_business_date,
 )
 
-_executor_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+_executor_pool: concurrent.futures.ThreadPoolExecutor | None = None
+_executor_pool_lock = threading.Lock()
+
+
+def get_executor_pool(config: dict[str, Any] | None = None) -> concurrent.futures.ThreadPoolExecutor:
+    global _executor_pool
+    with _executor_pool_lock:
+        if _executor_pool is None:
+            workers = 8
+            if config is not None:
+                workers = int(get_config_value(config, "executor.thread_pool_workers", 8))
+            _executor_pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=max(2, workers),
+                thread_name_prefix="arxiv-daily",
+            )
+        return _executor_pool
 
 
 def _fallback_tldr(p: Paper):
     # Avoid presenting raw abstracts as TLDR text in the UI.
     p.tldr = None
+    p.method = None
+    p.evidence = None
+    p.why_for_me = None
 
 
-def _get_llm_cache_key(config: dict[str, Any]) -> str:
-    return "|".join(
-        [
-            get_config_value(config, "llm.base_url"),
-            get_config_value(config, "llm.model"),
-            get_config_value(config, "llm.language"),
-        ]
-    )
+def _get_llm_cache_key(config: dict[str, Any], role: str = "summarize") -> str:
+    return make_llm_cache_key(config, role)
 
 
 def _default_llm_metrics(*, enabled: bool, target_count: int = 0) -> dict[str, object]:
@@ -50,30 +78,241 @@ def _default_llm_metrics(*, enabled: bool, target_count: int = 0) -> dict[str, o
         "llm_request_count": 0,
         "tldr_cache_hits": 0,
         "tldr_request_count": 0,
+        "judge_cache_hits": 0,
+        "judge_request_count": 0,
+        "llm_prompt_tokens": 0,
+        "llm_completion_tokens": 0,
+        "llm_warning": "",
     }
 
 
-async def _apply_tldr_enrichment(
-    papers: list[Paper], config: dict[str, Any], metrics: dict[str, object]
-) -> None:
-    llm_config = config.get("llm", {})
-    metrics.update(
-        _default_llm_metrics(
-            enabled=bool(llm_config.get("api_key")),
-            target_count=len(papers),
+def _merge_llm_usage(metrics: dict[str, object]) -> None:
+    usage = get_llm_usage()
+    metrics["llm_error_count"] = usage["llm_error_count"]
+    metrics["llm_prompt_tokens"] = usage["llm_prompt_tokens"]
+    metrics["llm_completion_tokens"] = usage["llm_completion_tokens"]
+    metrics["llm_warning"] = usage["llm_warning"]
+    metrics["llm_request_count"] = usage["llm_api_requests"]
+
+
+def _content_key(paper: Paper) -> str:
+    return make_content_key(paper.title, paper.abstract or "")
+
+
+def _profile_signatures(
+    corpus: Sequence[object], feedback: list[dict[str, Any]]
+) -> tuple[str, str]:
+    corpus_signature = hashlib.sha1(
+        "\n".join(
+            sorted(
+                make_content_key(
+                    getattr(paper, "title", "") or "",
+                    getattr(paper, "abstract", "") or "",
+                )
+                for paper in corpus
+            )
+        ).encode("utf-8")
+    ).hexdigest()
+    feedback_signature = hashlib.sha1(
+        "\n".join(
+            sorted(
+                f"{row.get('url')}|{row.get('vote')}|{row.get('updated_at') or ''}"
+                for row in feedback
+            )
+        ).encode("utf-8")
+    ).hexdigest()
+    return corpus_signature, feedback_signature
+
+
+def _copy_cached_tldr(paper: Paper, cached: dict[str, Any]) -> None:
+    paper.tldr = cached.get("tldr")
+    paper.method = cached.get("method")
+    paper.evidence = cached.get("evidence")
+    paper.why_for_me = cached.get("why_for_me")
+
+
+def _copy_cached_judgment(paper: Paper, cached: dict[str, Any]) -> None:
+    relevance = cached.get("judge_relevance")
+    paper.judge_relevance = float(relevance) if relevance is not None else None
+    paper.judge_reason = cached.get("judge_reason")
+    if cached.get("judge_keep") is None:
+        paper.judge_keep = None
+    else:
+        paper.judge_keep = bool(cached.get("judge_keep"))
+
+
+def _select_judged_papers(papers: list[Paper], max_num: int) -> list[Paper]:
+    kept = [paper for paper in papers if paper.judge_keep]
+    if len(kept) >= max_num:
+        return kept[:max_num]
+    rest = [paper for paper in papers if not paper.judge_keep]
+    rest.sort(
+        key=lambda paper: (
+            -(paper.judge_relevance if paper.judge_relevance is not None else -1),
         )
     )
+    return (kept + rest)[:max_num]
+
+
+def _attach_judgments(papers: list[Paper], judgments: list[dict[str, Any]]) -> None:
+    by_id = {str(item.get("id") or ""): item for item in judgments}
+    missing = 0
+    for index, paper in enumerate(papers):
+        item = by_id.get(paper.url or "")
+        if item is None and len(judgments) == len(papers):
+            item = judgments[index]
+        if not item:
+            missing += 1
+            continue
+        paper.judge_relevance = float(item["relevance"])
+        paper.judge_reason = item.get("reason") or ""
+        paper.judge_keep = bool(item.get("keep"))
+    if missing:
+        note_llm_error(f"{missing} 篇论文没有裁判结果")
+
+
+async def _ensure_interest_profile(
+    config: dict[str, Any], corpus: Sequence[object], *, llm_ready: bool
+) -> dict[str, Any] | None:
+    feedback = await db.list_feedback()
+    corpus_signature, feedback_signature = _profile_signatures(corpus, feedback)
+    cached = await db.load_interest_profile()
+    model = resolve_model(config, "profile")
+    prompt_version = PROMPT_VERSIONS["profile"]
+    cached_profile = (cached or {}).get("profile") if cached else None
+    if (
+        cached
+        and cached.get("corpus_signature") == corpus_signature
+        and cached.get("feedback_signature") == feedback_signature
+        and cached.get("model") == model
+        and cached.get("prompt_version") == prompt_version
+        and cached_profile
+    ):
+        logger.info("Using cached interest profile")
+        return cached_profile
+    if not llm_ready:
+        if cached_profile:
+            note_llm_warning("兴趣画像未更新，沿用上次缓存")
+            return cached_profile
+        return None
+
+    briefs = [
+        {"title": getattr(paper, "title", "") or "", "abstract": getattr(paper, "abstract", "") or ""}
+        for paper in corpus
+    ]
+    loop = asyncio.get_running_loop()
+    profile = await loop.run_in_executor(
+        get_executor_pool(config),
+        lambda: build_interest_profile(
+            briefs,
+            [
+                {"title": row.get("title") or "", "vote": row.get("vote") or ""}
+                for row in feedback
+            ],
+            config,
+        ),
+    )
+    if not profile:
+        if cached_profile:
+            note_llm_warning("兴趣画像生成失败，沿用上次缓存")
+            return cached_profile
+        return None
+    await db.save_interest_profile(
+        profile,
+        corpus_signature=corpus_signature,
+        feedback_signature=feedback_signature,
+        model=model,
+        prompt_version=prompt_version,
+    )
+    logger.info("Refreshed interest profile")
+    return profile
+
+
+async def _apply_judge(
+    papers: list[Paper],
+    profile: dict[str, Any] | None,
+    config: dict[str, Any],
+    metrics: dict[str, object],
+    *,
+    max_num: int | None = None,
+) -> list[Paper]:
+    if max_num is None:
+        max_num = max(1, int(get_config_value(config, "executor.max_paper_num")))
+    if not papers:
+        return []
+    cache_key = _get_llm_cache_key(config, "judge")
+    cached_enrichments = await db.load_candidate_enrichments(
+        [paper.url for paper in papers if paper.url]
+    )
+    pending: list[Paper] = []
+    hits = 0
+    for paper in papers:
+        cached = cached_enrichments.get(paper.url or "")
+        if (
+            cached
+            and cached.get("content_key") == _content_key(paper)
+            and cached.get("judge_cache_key") == cache_key
+            and cached.get("judge_relevance") is not None
+        ):
+            _copy_cached_judgment(paper, cached)
+            hits += 1
+        else:
+            pending.append(paper)
+    metrics["judge_cache_hits"] = hits
+    metrics["judge_request_count"] = 1 if pending else 0
+    if pending:
+        logger.info(f"Judging {len(pending)} shortlisted papers")
+        loop = asyncio.get_running_loop()
+        judgments = await loop.run_in_executor(
+            get_executor_pool(config),
+            lambda: judge_papers(pending, profile, config),
+        )
+        if not judgments:
+            logger.warning("Judge failed; keeping MMR order")
+            chosen = papers[:max_num]
+        else:
+            _attach_judgments(pending, judgments)
+            chosen = _select_judged_papers(papers, max_num)
+    else:
+        chosen = _select_judged_papers(papers, max_num)
+
+    entries = []
+    for paper in papers:
+        if not paper.url or paper.judge_relevance is None:
+            continue
+        entries.append(
+            {
+                "url": paper.url,
+                "pdf_url": paper.pdf_url,
+                "content_key": _content_key(paper),
+                "judge_relevance": paper.judge_relevance,
+                "judge_reason": paper.judge_reason,
+                "judge_keep": int(bool(paper.judge_keep)),
+                "judge_cache_key": cache_key,
+            }
+        )
+    await db.save_candidate_enrichments(entries)
+    return chosen
+
+
+async def _apply_tldr_enrichment(
+    papers: list[Paper],
+    config: dict[str, Any],
+    metrics: dict[str, object],
+    profile: dict[str, Any] | None = None,
+) -> None:
+    llm_config = config.get("llm", {})
+    metrics["llm_enabled"] = bool(llm_config.get("api_key"))
+    metrics["llm_target_count"] = len(papers)
     if not llm_config.get("api_key"):
         logger.info("No LLM API key configured, skipping TLDR generation")
         for paper in papers:
             _fallback_tldr(paper)
-        metrics.update(_default_llm_metrics(enabled=False))
+        metrics["llm_enabled"] = False
         return
 
-    logger.info("Generating TLDRs for selected papers...")
-    errors = []
-    failed_urls = set()
-    llm_cache_key = _get_llm_cache_key(config)
+    logger.info("Generating structured TLDRs for selected papers...")
+    llm_cache_key = _get_llm_cache_key(config, "summarize")
     cached_enrichments = await db.load_candidate_enrichments(
         [paper.url for paper in papers if paper.url]
     )
@@ -81,52 +320,62 @@ async def _apply_tldr_enrichment(
     papers_for_tldr = []
     for paper in papers:
         cached = cached_enrichments.get(paper.url or "")
-        content_key = make_content_key(paper.title, paper.abstract or "")
         if (
             cached
-            and cached.get("content_key") == content_key
+            and cached.get("content_key") == _content_key(paper)
             and cached.get("llm_cache_key") == llm_cache_key
-            and cached.get("tldr")
+            and (cached.get("tldr") or "").strip()
         ):
-            paper.tldr = cached["tldr"]
+            _copy_cached_tldr(paper, cached)
             tldr_cache_hits += 1
         else:
             papers_for_tldr.append(paper)
 
     metrics["llm_cache_hits"] = tldr_cache_hits
     metrics["tldr_cache_hits"] = tldr_cache_hits
-    metrics["llm_request_count"] = len(papers_for_tldr)
-    metrics["tldr_request_count"] = len(papers_for_tldr)
-
-    for paper in papers_for_tldr:
-        try:
-            paper.tldr = generate_tldr(paper, config)
-            if not paper.tldr:
+    metrics["tldr_request_count"] = 1 if papers_for_tldr else 0
+    generated: dict[str, dict[str, str]] = {}
+    if papers_for_tldr:
+        loop = asyncio.get_running_loop()
+        batch = await loop.run_in_executor(
+            get_executor_pool(config),
+            lambda: generate_tldrs_batch(papers_for_tldr, profile, config),
+        )
+        generated = batch or {}
+        for index, paper in enumerate(papers_for_tldr):
+            payload = generated.get(paper.url or "")
+            if payload is None and len(generated) == 1 and len(papers_for_tldr) == 1:
+                payload = next(iter(generated.values()))
+            if not payload or not payload.get("tldr"):
+                note_llm_error(f"TLDR 为空或解析失败：{paper.url or paper.title}")
                 _fallback_tldr(paper)
-        except Exception as e:
-            errors.append((paper, e))
-            if getattr(paper, "url", None):
-                failed_urls.add(paper.url)
-            _fallback_tldr(paper)
-
-    for paper, error in errors:
-        logger.warning(f"Error processing {paper.title}: {error}")
+                continue
+            paper.tldr = payload["tldr"]
+            paper.method = payload.get("method") or None
+            paper.evidence = payload.get("evidence") or None
+            paper.why_for_me = payload.get("why_for_me") or None
 
     cache_entries = []
     for paper in papers:
-        content_key = make_content_key(paper.title, paper.abstract or "")
+        content_key = _content_key(paper)
         cached = cached_enrichments.get(paper.url or "", {})
         entry = {
             "url": paper.url,
             "pdf_url": paper.pdf_url,
             "content_key": content_key,
             "tldr": None,
+            "method": None,
+            "evidence": None,
+            "why_for_me": None,
             "llm_cache_key": None,
         }
-        if paper.url not in failed_urls and paper.tldr:
+        if paper.tldr:
             entry.update(
                 {
                     "tldr": paper.tldr,
+                    "method": paper.method,
+                    "evidence": paper.evidence,
+                    "why_for_me": paper.why_for_me,
                     "llm_cache_key": llm_cache_key,
                 }
             )
@@ -138,13 +387,16 @@ async def _apply_tldr_enrichment(
             entry.update(
                 {
                     "tldr": cached.get("tldr"),
+                    "method": cached.get("method"),
+                    "evidence": cached.get("evidence"),
+                    "why_for_me": cached.get("why_for_me"),
                     "llm_cache_key": cached.get("llm_cache_key"),
                 }
             )
         cache_entries.append(entry)
 
     await db.save_candidate_enrichments(cache_entries)
-    metrics["llm_error_count"] = len(errors)
+    _merge_llm_usage(metrics)
 
 
 async def _filter_seen_papers(
@@ -308,7 +560,7 @@ class Executor:
         previous_corpus = cached if cached else None
         previous_manifest = cached_manifest
         return await loop.run_in_executor(
-            _executor_pool,
+            get_executor_pool(self.config),
             lambda: fetch_corpus(
                 self.config["webdav"],
                 self.config.get("executor", {}),
@@ -342,14 +594,31 @@ class Executor:
         await db.save_corpus_cache(corpus)
 
         sources = self.config.get("executor", {}).get("source", ["arxiv"])
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         source_metrics: list[dict[str, object]] = []
+        reset_llm_usage()
+        use_llm = bool(self.config.get("llm", {}).get("api_key")) and not skip_tldr
+        llm_ready = False
+        if use_llm:
+            llm_ready, llm_message = await loop.run_in_executor(
+                get_executor_pool(self.config),
+                lambda: check_connectivity(self.config),
+            )
+            if not llm_ready:
+                logger.error(llm_message)
+                note_llm_error(llm_message)
+        elif not skip_tldr and not self.config.get("llm", {}).get("api_key"):
+            note_llm_warning("未配置 LLM API key，已跳过画像、裁判和 TLDR")
+        profile = await _ensure_interest_profile(self.config, corpus, llm_ready=llm_ready)
+        retrieval_config = copy.deepcopy(self.config)
+        if profile:
+            retrieval_config["interest_profile"] = profile
 
         async def _retrieve_source(source: str) -> tuple[str, list[Paper]]:
             logger.info(f"Retrieving {source} papers...")
-            retriever = get_retriever_cls(source)(self.config)
+            retriever = get_retriever_cls(source)(retrieval_config)
             papers = await loop.run_in_executor(
-                _executor_pool,
+                get_executor_pool(self.config),
                 lambda retriever=retriever: retriever.retrieve_papers(corpus),
             )
             return source, papers
@@ -373,6 +642,7 @@ class Executor:
                     "final_recommendations": 0,
                 }
             )
+            _merge_llm_usage(self.last_run_metrics)
             return []
 
         self.last_run_metrics["retrieved_candidates"] = len(all_papers)
@@ -386,6 +656,7 @@ class Executor:
                     "final_recommendations": 0,
                 }
             )
+            _merge_llm_usage(self.last_run_metrics)
             return []
 
         logger.info(f"Total {len(all_papers)} papers from all sources")
@@ -393,17 +664,31 @@ class Executor:
         logger.info("Reranking with local reranker...")
         reranker = get_reranker_cls("local")(self.config)
         reranked = await loop.run_in_executor(
-            _executor_pool, lambda: reranker.rerank(all_papers, corpus)
+            get_executor_pool(self.config), lambda: reranker.rerank(all_papers, corpus)
         )
-
-        max_num = int(get_config_value(self.config, "executor.max_paper_num"))
-        reranked = reranked[:max_num]
         self.last_run_metrics["reranked_candidates"] = len(reranked)
+        max_num = int(get_config_value(self.config, "executor.max_paper_num"))
 
-        if not skip_tldr:
-            await _apply_tldr_enrichment(reranked, self.config, self.last_run_metrics)
+        if use_llm and llm_ready:
+            self.last_run_metrics.update(
+                _default_llm_metrics(enabled=True, target_count=min(len(reranked), max_num))
+            )
+            reranked = await _apply_judge(
+                reranked, profile, self.config, self.last_run_metrics
+            )
+            await _apply_tldr_enrichment(
+                reranked, self.config, self.last_run_metrics, profile
+            )
         else:
-            self.last_run_metrics.update(_default_llm_metrics(enabled=False))
+            reranked = reranked[:max_num]
+            self.last_run_metrics.update(
+                _default_llm_metrics(enabled=False, target_count=len(reranked))
+            )
+            for paper in reranked:
+                _fallback_tldr(paper)
+            if use_llm and not llm_ready:
+                _merge_llm_usage(self.last_run_metrics)
+                self.last_run_metrics["llm_enabled"] = True
 
         tz_name = get_config_value(self.config, "executor.timezone")
         await db.save_papers(reranked, business_date)
@@ -416,5 +701,93 @@ class Executor:
             }
         )
         logger.info(f"Saved {len(reranked)} recommended papers for {business_date}")
+        if use_llm:
+            self.last_run_metrics["llm_models"] = {
+                "extract": resolve_model(self.config, "extract"),
+                "summarize": resolve_model(self.config, "summarize"),
+                "judge": resolve_model(self.config, "judge"),
+            }
+            _merge_llm_usage(self.last_run_metrics)
 
         return reranked
+
+    async def enrich_saved_dates(self, dates: list[str]) -> dict[str, object]:
+        """Fill TLDR and judge fields for papers already stored. Does not call arXiv."""
+        reset_llm_usage()
+        self.last_run_metrics = {"status": "running", "mode": "enrich", "dates": []}
+        if not self.config.get("llm", {}).get("api_key"):
+            note_llm_error("未配置 LLM API key，无法补全已入库论文")
+            _merge_llm_usage(self.last_run_metrics)
+            self.last_run_metrics["status"] = "llm_unavailable"
+            return self.last_run_metrics
+
+        corpus = await self.fetch_corpus()
+        loop = asyncio.get_running_loop()
+        llm_ready, llm_message = await loop.run_in_executor(
+            get_executor_pool(self.config),
+            lambda: check_connectivity(self.config),
+        )
+        if not llm_ready:
+            note_llm_error(llm_message)
+            _merge_llm_usage(self.last_run_metrics)
+            self.last_run_metrics["status"] = "llm_unavailable"
+            return self.last_run_metrics
+
+        profile = await _ensure_interest_profile(self.config, corpus, llm_ready=True)
+        summaries: list[dict[str, object]] = []
+        for business_date in dates:
+            rows = await db.get_papers_by_date(business_date)
+            papers = [_paper_from_row(row) for row in rows]
+            if not papers:
+                summaries.append({"date": business_date, "papers": 0, "tldr": 0})
+                continue
+            metrics = _default_llm_metrics(enabled=True, target_count=len(papers))
+            papers = await _apply_judge(
+                papers, profile, self.config, metrics, max_num=len(papers)
+            )
+            await _apply_tldr_enrichment(papers, self.config, metrics, profile)
+            await db.save_papers(papers, business_date)
+            summaries.append(
+                {
+                    "date": business_date,
+                    "papers": len(papers),
+                    "tldr": sum(1 for paper in papers if paper.tldr),
+                    "judged": sum(1 for paper in papers if paper.judge_relevance is not None),
+                }
+            )
+        self.last_run_metrics = {
+            "status": "completed",
+            "mode": "enrich",
+            "dates": summaries,
+            "final_recommendations": sum(int(item["papers"]) for item in summaries),
+        }
+        _merge_llm_usage(self.last_run_metrics)
+        return self.last_run_metrics
+
+
+def _paper_from_row(row: dict[str, Any]) -> Paper:
+    authors = row.get("authors")
+    if isinstance(authors, str):
+        try:
+            authors = json.loads(authors)
+        except json.JSONDecodeError:
+            authors = []
+    keep = row.get("judge_keep")
+    return Paper(
+        source=row.get("source") or "arxiv",
+        title=row.get("title") or "",
+        authors=authors or [],
+        abstract=row.get("abstract") or "",
+        url=row.get("url") or "",
+        pdf_url=row.get("pdf_url"),
+        code_url=row.get("code_url"),
+        tldr=row.get("tldr"),
+        method=row.get("method"),
+        evidence=row.get("evidence"),
+        why_for_me=row.get("why_for_me"),
+        score=row.get("score"),
+        judge_relevance=row.get("judge_relevance"),
+        judge_reason=row.get("judge_reason"),
+        judge_keep=None if keep is None else bool(keep),
+        date=row.get("date"),
+    )
