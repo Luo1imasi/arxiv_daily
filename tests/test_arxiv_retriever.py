@@ -563,6 +563,7 @@ class AdaptiveLookbackTests(unittest.TestCase):
 
         old_arxiv = arxiv_retriever_module._ARXIV
         old_wait = arxiv_retriever_module._wait_for_arxiv_request_slot
+        old_sleep = arxiv_retriever_module._sleep_for_retry
         arxiv_retriever_module._ARXIV = cast(
             Any,
             type("ArxivStub", (), {"Search": Search, "Client": Client}),
@@ -570,6 +571,7 @@ class AdaptiveLookbackTests(unittest.TestCase):
         arxiv_retriever_module._wait_for_arxiv_request_slot = lambda: wait_calls.__setitem__(
             "count", wait_calls["count"] + 1
         )
+        arxiv_retriever_module._sleep_for_retry = lambda delay: None
         try:
             retriever = ArxivRetriever(
                 {
@@ -581,16 +583,117 @@ class AdaptiveLookbackTests(unittest.TestCase):
         finally:
             arxiv_retriever_module._ARXIV = old_arxiv
             arxiv_retriever_module._wait_for_arxiv_request_slot = old_wait
+            arxiv_retriever_module._sleep_for_retry = old_sleep
 
-        self.assertEqual(batch_ids, [["a", "b", "c", "d"]])
+        self.assertEqual(batch_ids, [["a", "b", "c", "d"], ["a", "b", "c", "d"], ["a", "b", "c", "d"]])
         self.assertEqual(papers, [])
-        self.assertEqual(wait_calls["count"], 1)
+        self.assertEqual(wait_calls["count"], 3)
 
     def test_oversized_arxiv_request_detection_matches_url_length_errors(self):
         self.assertTrue(_looks_like_oversized_arxiv_request(RuntimeError("414")))
         self.assertTrue(_looks_like_oversized_arxiv_request(RuntimeError("URI Too Long")))
         self.assertTrue(_looks_like_oversized_arxiv_request(RuntimeError("URL too long")))
         self.assertFalse(_looks_like_oversized_arxiv_request(RuntimeError("503 Service Unavailable")))
+
+
+class TermQueryTests(unittest.TestCase):
+    def test_canonical_terms_become_abs_and_title_queries_without_categories(self):
+        retriever = ArxivRetriever(
+            {
+                "source": {
+                    "arxiv": {
+                        "category": ["cs.AI"],
+                        "keyword_query_group_size": 2,
+                        "keyword_query_max_groups": 2,
+                    }
+                }
+            }
+        )
+
+        queries = retriever._term_search_queries(
+            ["graph neural network", "retrieval", "a", "graph neural network"]
+        )
+
+        self.assertEqual(len(queries), 1)
+        self.assertIn('abs:"graph neural network"', queries[0])
+        self.assertIn('ti:"graph neural network"', queries[0])
+        self.assertIn("abs:retrieval", queries[0])
+        self.assertNotIn("cat:", queries[0])
+
+    def test_empty_term_search_falls_back_to_one_category_query(self):
+        captured: list[str] = []
+
+        class SortCriterion:
+            SubmittedDate = "submittedDate"
+
+        class SortOrder:
+            Descending = "descending"
+
+        class Search:
+            def __init__(self, **kwargs: object):
+                captured.append(cast(str, kwargs["query"]))
+
+        class Client:
+            def __init__(self, **kwargs: object):
+                pass
+
+            def results(self, search: object):
+                del search
+                return iter([])
+
+        retriever = ArxivRetriever(
+            {
+                "executor": {"business_date": "2026-10-06", "timezone": "UTC"},
+                "source": {
+                    "arxiv": {
+                        "category": ["cs.AI"],
+                        "recent_days": 1,
+                        "recent_max_results": 50,
+                        "keyword_query_max_results": 20,
+                    }
+                },
+            }
+        )
+        retriever._active_terms = ["graph neural network"]
+        old_arxiv = arxiv_retriever_module._ARXIV
+        old_wait = arxiv_retriever_module._wait_for_arxiv_request_slot
+        arxiv_retriever_module._ARXIV = cast(
+            Any,
+            type(
+                "ArxivStub",
+                (),
+                {
+                    "Search": Search,
+                    "Client": Client,
+                    "SortCriterion": SortCriterion,
+                    "SortOrder": SortOrder,
+                },
+            ),
+        )
+        arxiv_retriever_module._wait_for_arxiv_request_slot = lambda: None
+        try:
+            papers = retriever._fetch_recent_category_papers(["cs.AI"])
+        finally:
+            arxiv_retriever_module._ARXIV = old_arxiv
+            arxiv_retriever_module._wait_for_arxiv_request_slot = old_wait
+
+        self.assertEqual(papers, [])
+        self.assertEqual(len(captured), 2)
+        self.assertIn('abs:"graph neural network"', captured[0])
+        self.assertNotIn("cat:", captured[0])
+        self.assertIn("cat:cs.AI", captured[1])
+
+    def test_candidate_cache_key_changes_with_query_terms(self):
+        config = {
+            "executor": {"business_date": "2026-10-06", "timezone": "UTC"},
+            "source": {"arxiv": {"category": ["cs.AI"], "recent_days": 1}},
+        }
+        retriever = ArxivRetriever(config)
+        plain = retriever._candidate_cache_key(["cs.AI"], start_days_ago=0, end_days_ago=1)
+        retriever._active_terms = ["retrieval augmented generation"]
+        termed = retriever._candidate_cache_key(["cs.AI"], start_days_ago=0, end_days_ago=1)
+
+        self.assertNotEqual(plain, termed)
 
 
 class LocalKeywordExtractionTests(unittest.TestCase):

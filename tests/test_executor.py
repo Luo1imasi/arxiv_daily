@@ -8,7 +8,15 @@ from typing import cast, override
 
 from arxiv_daily import database as db
 from arxiv_daily import webdav as webdav_module
-from arxiv_daily.executor import Executor, _default_llm_metrics, _fallback_tldr, _filter_seen_papers
+from arxiv_daily.executor import (
+    Executor,
+    _apply_tldr_enrichment,
+    _default_llm_metrics,
+    _fallback_tldr,
+    _filter_seen_papers,
+    _profile_signatures,
+    _select_judged_papers,
+)
 from arxiv_daily.protocol import CorpusPaper
 from arxiv_daily.protocol import Paper
 from arxiv_daily.retriever.base import BaseRetriever, register_retriever
@@ -45,6 +53,11 @@ class DefaultLlmMetricsTests(unittest.TestCase):
                 "llm_request_count": 0,
                 "tldr_cache_hits": 0,
                 "tldr_request_count": 0,
+                "judge_cache_hits": 0,
+                "judge_request_count": 0,
+                "llm_prompt_tokens": 0,
+                "llm_completion_tokens": 0,
+                "llm_warning": "",
             },
         )
 
@@ -293,6 +306,35 @@ class CorpusManifestTests(unittest.IsolatedAsyncioTestCase):
                     os.environ["ARXIV_DAILY_DATA"] = old_data_dir
 
 
+class JudgeSelectionTests(unittest.TestCase):
+    def test_keeps_mmr_order_and_fills_when_too_few_are_marked(self):
+        papers = [
+            Paper(source="arxiv", title=f"P{index}", authors=[], abstract="a", url=f"https://example.com/{index}", judge_relevance=float(index), judge_keep=index >= 3)
+            for index in range(5)
+        ]
+
+        chosen = _select_judged_papers(papers, 3)
+
+        self.assertEqual([paper.url for paper in chosen], [
+            "https://example.com/3",
+            "https://example.com/4",
+            "https://example.com/2",
+        ])
+
+
+class ProfileSignatureTests(unittest.TestCase):
+    def test_feedback_changes_the_profile_signature(self):
+        corpus = [CorpusPaper(title="Agents", abstract="Planning", added_date=datetime(2026, 10, 6))]
+        before = _profile_signatures(corpus, [])
+        after = _profile_signatures(
+            corpus,
+            [{"url": "https://example.com/a", "vote": "irrelevant", "updated_at": "2026-10-06T00:00:00+00:00"}],
+        )
+
+        self.assertEqual(before[0], after[0])
+        self.assertNotEqual(before[1], after[1])
+
+
 class CandidateEnrichmentCacheTests(unittest.IsolatedAsyncioTestCase):
     async def test_save_candidate_enrichment_clears_stale_tldr_when_explicitly_empty(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -328,6 +370,81 @@ class CandidateEnrichmentCacheTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(cached["https://example.com/paper"]["content_key"], "new-content")
                 self.assertIsNone(cached["https://example.com/paper"]["tldr"])
                 self.assertIsNone(cached["https://example.com/paper"]["llm_cache_key"])
+            finally:
+                if old_data_dir is None:
+                    os.environ.pop("ARXIV_DAILY_DATA", None)
+                else:
+                    os.environ["ARXIV_DAILY_DATA"] = old_data_dir
+
+    async def test_old_or_empty_tldr_cache_does_not_hit(self):
+        from unittest.mock import patch
+
+        from arxiv_daily.llm import make_llm_cache_key
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_data_dir = os.environ.get("ARXIV_DAILY_DATA")
+            os.environ["ARXIV_DAILY_DATA"] = tmpdir
+            try:
+                await db.init_db()
+                config = {
+                    "llm": {
+                        "api_key": "test-key",
+                        "base_url": "http://127.0.0.1:9/v1",
+                        "model": "deepseek-flash",
+                        "language": "Chinese",
+                        "models": {"summarize": "deepseek-flash"},
+                    }
+                }
+                paper = Paper(
+                    source="arxiv",
+                    title="Cached Paper",
+                    authors=["Ada"],
+                    abstract="An abstract about retrieval.",
+                    url="https://example.com/cached",
+                )
+                content_key = make_content_key(paper.title, paper.abstract or "")
+                await db.save_candidate_enrichments(
+                    [
+                        {
+                            "url": paper.url,
+                            "content_key": content_key,
+                            "tldr": "old empty-looking summary",
+                            "llm_cache_key": "base|old-model|Chinese",
+                        }
+                    ]
+                )
+                metrics: dict[str, object] = {}
+                payload = {
+                    paper.url: {
+                        "tldr": "中文总结",
+                        "method": "方法",
+                        "evidence": "证据",
+                        "why_for_me": "适合我",
+                    }
+                }
+                with patch("arxiv_daily.executor.generate_tldrs_batch", return_value=payload) as generate:
+                    await _apply_tldr_enrichment([paper], config, metrics, None)
+
+                generate.assert_called_once()
+                self.assertEqual(paper.tldr, "中文总结")
+                self.assertEqual(paper.method, "方法")
+                self.assertEqual(metrics["tldr_cache_hits"], 0)
+
+                fresh = Paper(
+                    source="arxiv",
+                    title="Cached Paper",
+                    authors=["Ada"],
+                    abstract="An abstract about retrieval.",
+                    url="https://example.com/cached",
+                )
+                hit_metrics: dict[str, object] = {}
+                with patch("arxiv_daily.executor.generate_tldrs_batch", return_value=payload) as generate_again:
+                    await _apply_tldr_enrichment([fresh], config, hit_metrics, None)
+
+                generate_again.assert_not_called()
+                self.assertEqual(fresh.tldr, "中文总结")
+                self.assertEqual(hit_metrics["tldr_cache_hits"], 1)
+                self.assertIn("tldr-v2", str(make_llm_cache_key(config, "summarize")))
             finally:
                 if old_data_dir is None:
                     os.environ.pop("ARXIV_DAILY_DATA", None)

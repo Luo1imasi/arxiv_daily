@@ -2,7 +2,8 @@ import os
 import sys
 import json
 import hmac
-from datetime import date, datetime, timezone
+import copy
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
@@ -28,7 +29,11 @@ from .config import (
 )
 from .executor import Executor
 from .task_runner import TaskRunner
-from .business_date import get_business_date, get_business_timezone_info
+from .business_date import (
+    business_date_range_between,
+    get_business_date,
+    get_business_timezone_info,
+)
 
 BASE_DIR = Path(__file__).parent
 SENSITIVE_KEYS = {"password", "api_key", "key", "admin_password"}
@@ -69,6 +74,58 @@ def _mask_password(d: dict[str, Any]) -> dict[str, Any]:
         else:
             result[k] = v
     return result
+
+
+def public_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Settings a reader can see. Secrets and filesystem paths stay out."""
+    arxiv_config = (config.get("source") or {}).get("arxiv") or {}
+    llm_config = config.get("llm") or {}
+    executor_config = config.get("executor") or {}
+    reranker_config = config.get("reranker") or {}
+    models = llm_config.get("models") if isinstance(llm_config.get("models"), dict) else {}
+    return {
+        "source": {
+            "arxiv": {
+                "category": arxiv_config.get("category") or [],
+                "include_cross_list": bool(arxiv_config.get("include_cross_list")),
+                "use_keyword_search": bool(arxiv_config.get("use_keyword_search")),
+                "recent_days": arxiv_config.get("recent_days"),
+                "max_keywords": arxiv_config.get("max_keywords"),
+            }
+        },
+        "llm": {
+            "language": llm_config.get("language"),
+            "model": llm_config.get("model"),
+            "models": {
+                "extract": models.get("extract"),
+                "summarize": models.get("summarize"),
+                "judge": models.get("judge"),
+            },
+            "configured": bool(llm_config.get("api_key")),
+        },
+        "executor": {
+            "max_paper_num": executor_config.get("max_paper_num"),
+            "timezone": executor_config.get("timezone"),
+            "schedule_hour": executor_config.get("schedule_hour"),
+            "schedule_minute": executor_config.get("schedule_minute"),
+            "source": executor_config.get("source"),
+        },
+        "reranker": {"model": reranker_config.get("model")},
+    }
+
+
+def admin_config_view(config: dict[str, Any]) -> dict[str, Any]:
+    """Full settings for an authenticated operator, with secrets removed."""
+    redacted = copy.deepcopy(config)
+    for section_name in ("webdav", "llm", "server"):
+        section = redacted.get(section_name)
+        if not isinstance(section, dict):
+            continue
+        for key in list(section):
+            if key in SENSITIVE_KEYS:
+                section[f"{key}_set"] = bool(section.get(key))
+                section.pop(key, None)
+    return redacted
 
 
 def _get_schedule_settings(config: dict[str, Any]) -> tuple[str, ZoneInfo, int, int]:
@@ -138,7 +195,7 @@ async def _build_page_context(current_date: str | None) -> dict[str, Any]:
         "papers": papers,
         "dates": dates,
         "current_date": current_date,
-        "config": _mask_password(_app_config),
+        "config": public_config(_app_config),
         "has_corpus": corpus_count > 0,
         "task_running": status["running"],
         "latest_run": latest_run,
@@ -200,6 +257,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     _configure_logging()
 
     await db.init_db()
+    interrupted = await db.fail_orphaned_running_tasks(
+        "Process restarted before the task finished"
+    )
+    if interrupted:
+        logger.warning(f"Marked {interrupted} interrupted task(s) as failed")
 
     config = load_config()
     _app_config = config
@@ -209,8 +271,26 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     _scheduler.add_job(
         scheduled_run, "cron", hour=hour, minute=minute, id="daily_run", timezone=tz
     )
+    _scheduler.add_job(
+        scheduled_catchup,
+        "cron",
+        hour="11,15,20",
+        minute=15,
+        id="daily_catchup",
+        timezone=tz,
+    )
+    _scheduler.add_job(
+        scheduled_cache_cleanup,
+        "cron",
+        hour=3,
+        minute=40,
+        id="cache_cleanup",
+        timezone=tz,
+    )
     _scheduler.start()
     logger.info(f"Scheduler started: daily run at {hour:02d}:{minute:02d} ({tz_name})")
+    logger.info(f"Same-day catch-up scheduled at 11:15, 15:15 and 20:15 ({tz_name})")
+    logger.info(f"Expired candidate cache cleanup scheduled at 03:40 ({tz_name})")
 
     yield
 
@@ -227,6 +307,39 @@ async def scheduled_run():
         await _task_runner.wait()
     except Exception as e:
         logger.error(f"Scheduled run failed: {e}")
+
+
+async def scheduled_cache_cleanup():
+    deleted = await db.purge_expired_candidate_cache()
+    if deleted:
+        logger.info(f"Periodic cleanup removed {deleted} expired candidate cache rows")
+
+
+async def scheduled_catchup():
+    if _task_runner.is_running():
+        logger.info("A task is already running, skipping same-day catch-up")
+        return
+    today = get_business_date(_app_config).isoformat()
+    if await db.get_papers_by_date(today):
+        return
+    tz_name, _tz = get_business_timezone_info(_app_config)
+    counts = await db.count_task_runs_started_on(
+        today,
+        task_name="daily recommendation",
+        timezone_name=tz_name,
+    )
+    if counts["succeeded"] or counts["total"] >= 3:
+        logger.info(
+            f"Skipping same-day catch-up for {today}: "
+            f"{counts['succeeded']} succeeded, {counts['total']} attempts"
+        )
+        return
+    logger.info(f"Starting same-day catch-up for {today}")
+    await _start_executor_run(skip_tldr=False, trigger="catchup")
+    try:
+        await _task_runner.wait()
+    except Exception as exc:
+        logger.error(f"Same-day catch-up failed: {exc}")
 
 
 app = FastAPI(title="arXiv Daily", lifespan=lifespan)
@@ -295,7 +408,13 @@ async def task_status():
 
 @app.get("/api/config")
 async def get_config():
-    return JSONResponse(_mask_password(_app_config))
+    return JSONResponse(public_config(_app_config))
+
+
+@app.get("/api/config/admin")
+async def get_admin_config(request: Request):
+    await _require_admin_password(request)
+    return JSONResponse(admin_config_view(_app_config))
 
 
 @app.post("/api/config")
@@ -354,7 +473,17 @@ async def test_llm(request: Request):
     body = await request.json()
     from .llm import test_connection
 
-    test_config = {"llm": body}
+    saved = _app_config.get("llm") or {}
+    api_key = str(body.get("api_key") or "")
+    if not api_key or api_key == "****":
+        api_key = str(saved.get("api_key") or "")
+    test_config = {
+        "llm": {
+            **saved,
+            **{key: value for key, value in body.items() if value not in (None, "")},
+            "api_key": api_key,
+        }
+    }
     ok = test_connection(test_config)
     return JSONResponse({"success": ok})
 
@@ -378,6 +507,122 @@ async def reload_corpus(request: Request):
         result_to_metrics=lambda corpus: {"corpus_count": len(corpus)},
     )
     return JSONResponse({"status": "started", "message": "Corpus reload started"})
+
+
+@app.post("/api/feedback")
+async def save_feedback(request: Request):
+    await _require_admin_password(request)
+    body = await request.json()
+    url = str(body.get("url") or "").strip()
+    vote = str(body.get("vote") or "").strip()
+    if not url or vote not in {"relevant", "irrelevant"}:
+        raise HTTPException(status_code=400, detail="url and a relevant/irrelevant vote are required")
+    await db.upsert_feedback(
+        url=url,
+        vote=vote,
+        date=str(body.get("date") or ""),
+        title=str(body.get("title") or ""),
+        tldr=str(body.get("tldr") or ""),
+    )
+    return JSONResponse({"status": "ok", "vote": vote})
+
+
+@app.post("/api/enrich")
+async def enrich_saved(request: Request):
+    await _require_admin_password(request)
+    if _task_runner.is_running():
+        raise HTTPException(status_code=409, detail="A task is already running")
+    body = await request.json()
+    start_date = _parse_backfill_date(body.get("start_date"), "start_date")
+    end_date = _parse_backfill_date(body.get("end_date"), "end_date")
+    today = _current_business_date(_app_config)
+    if start_date > today or end_date > today or start_date > end_date:
+        raise HTTPException(status_code=400, detail="invalid enrich date range")
+    dates = business_date_range_between(_app_config, start_date, end_date)
+    executor = Executor(_app_config)
+    await _task_runner.start(
+        "enrich saved papers",
+        lambda: executor.enrich_saved_dates(dates),
+        trigger="manual",
+        metadata={"start_date": start_date.isoformat(), "end_date": end_date.isoformat()},
+        result_to_metrics=lambda result: dict(result) if isinstance(result, dict) else {},
+    )
+    return JSONResponse({"status": "started", "message": "Enrichment started"})
+
+
+@app.post("/api/qa")
+async def ask_question(request: Request):
+    await _require_admin_password(request)
+    if _task_runner.is_running():
+        raise HTTPException(status_code=409, detail="A task is already running")
+    body = await request.json()
+    question = str(body.get("question") or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="question is required")
+    if len(question) > 1000:
+        raise HTTPException(status_code=400, detail="question is too long")
+
+    import asyncio
+
+    from .llm import answer_question as generate_answer
+    from .llm import reset_llm_usage
+    from .reranker.local import rank_items_by_query
+
+    today = _current_business_date(_app_config)
+    papers = await db.get_papers_between((today - timedelta(days=21)).isoformat(), today.isoformat())
+    corpus = await db.load_corpus_cache()
+    items: list[dict[str, str]] = []
+    for paper in corpus:
+        items.append(
+            {
+                "title": paper.title,
+                "abstract": paper.abstract or "",
+                "url": "",
+                "date": "",
+                "tldr": "",
+                "reason": "语料库",
+                "score": "",
+            }
+        )
+    for paper in papers:
+        items.append(
+            {
+                "title": str(paper.get("title") or ""),
+                "abstract": str(paper.get("abstract") or ""),
+                "url": str(paper.get("url") or ""),
+                "date": str(paper.get("date") or ""),
+                "tldr": str(paper.get("tldr") or ""),
+                "reason": str(paper.get("judge_reason") or ""),
+                "score": str(paper.get("judge_relevance") or paper.get("score") or ""),
+            }
+        )
+    loop = asyncio.get_running_loop()
+    ranked = await loop.run_in_executor(
+        None, lambda: rank_items_by_query(_app_config, question, items, top_k=8)
+    )
+    contexts = []
+    for index, score in ranked:
+        item = dict(items[index])
+        item["score"] = f"{score:.3f}"
+        contexts.append(item)
+    if not contexts:
+        return JSONResponse({"answer": "本地库里没有可检索的论文。", "sources": []})
+    reset_llm_usage()
+    answer = await loop.run_in_executor(
+        None, lambda: generate_answer(question, contexts, _app_config)
+    )
+    if not answer:
+        raise HTTPException(status_code=502, detail="LLM 没有返回答案")
+    sources = [
+        {
+            "title": item["title"],
+            "url": item["url"],
+            "date": item["date"],
+            "score": item["score"],
+        }
+        for item in contexts
+    ]
+    return JSONResponse({"answer": answer, "sources": sources})
 
 
 @app.get("/api/stats")

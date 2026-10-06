@@ -29,6 +29,9 @@
                 <button type="button" class="btn btn-secondary" onclick="triggerBackfill()" id="backfillBtn">
                     Backfill
                 </button>
+                <button type="button" class="btn btn-secondary" onclick="triggerEnrich()" id="enrichBtn">
+                    补全已入库
+                </button>
             </div>
         </div>
     </nav>
@@ -38,6 +41,13 @@
             <div class="stats-card">
                 <h3>Stats</h3>
                 <div id="stats-content">Loading...</div>
+            </div>
+            <div class="qa-card">
+                <h3>问本地库</h3>
+                <p class="qa-hint">只检索已入库推荐和本地语料，不访问 arXiv。</p>
+                <textarea id="qaQuestion" rows="3" placeholder="例如：最近有哪些和检索增强生成相关的论文？"></textarea>
+                <button type="button" class="btn btn-secondary" id="qaBtn" onclick="askQuestion()">提问</button>
+                <div id="qaAnswer" class="qa-answer"></div>
             </div>
             <div class="dates-card">
                 <h3>Dates</h3>
@@ -63,6 +73,13 @@
                     <span id="taskBannerText" class="task-banner-text">A task is currently running...</span>
                 </div>
             </div>
+            {% if latest_run and latest_run.metrics and (latest_run.metrics.llm_error_count or latest_run.metrics.llm_warning) %}
+            <div class="alert alert-warning" id="llmStatusBanner">
+                <strong>LLM 状态：</strong>
+                错误 {{ latest_run.metrics.llm_error_count or 0 }} 次
+                {% if latest_run.metrics.llm_warning %} · {{ latest_run.metrics.llm_warning }}{% endif %}
+            </div>
+            {% endif %}
 
             {% if current_date %}
             <div class="date-header">
@@ -108,16 +125,41 @@
                 {% set score_tier = "score-tier-watch" %}
                 {% set score_label = "Candidate" %}
             {% endif %}
+            {% set judge = paper.judge_relevance %}
+            {% if judge is not none %}
+                {% if judge >= 4.5 %}
+                    {% set judge_tier = "judge-tier-excellent" %}
+                    {% set judge_label = "很相关" %}
+                {% elif judge >= 3.5 %}
+                    {% set judge_tier = "judge-tier-strong" %}
+                    {% set judge_label = "相关" %}
+                {% elif judge >= 2.5 %}
+                    {% set judge_tier = "judge-tier-good" %}
+                    {% set judge_label = "一般" %}
+                {% else %}
+                    {% set judge_tier = "judge-tier-watch" %}
+                    {% set judge_label = "偏低" %}
+                {% endif %}
+            {% endif %}
             <div class="paper-card {{ score_tier }}" data-score="{{ score }}">
                 <div class="paper-header">
                     <h3 class="paper-title">
                         <a href="{{ paper.url }}" target="_blank" rel="noopener noreferrer">{{ paper.title }}</a>
                     </h3>
-                    <span class="paper-score">
-                        <span class="paper-score-value">{{ "%.1f"|format(score) }}</span>
-                        <span class="paper-score-label">{{ score_label }}</span>
-                        <span class="paper-score-note">daily relative</span>
-                    </span>
+                    <div class="paper-scores">
+                        {% if judge is not none %}
+                        <span class="paper-score {{ judge_tier }}">
+                            <span class="paper-score-value">{{ "%.1f"|format(judge) }}<span class="paper-score-denom">/5</span></span>
+                            <span class="paper-score-label">{{ judge_label }}</span>
+                            <span class="paper-score-note">裁判分</span>
+                        </span>
+                        {% endif %}
+                        <span class="paper-score">
+                            <span class="paper-score-value">{{ "%.1f"|format(score) }}</span>
+                            <span class="paper-score-label">{{ score_label }}</span>
+                            <span class="paper-score-note">当日相对</span>
+                        </span>
+                    </div>
                 </div>
 
                 <div class="paper-meta">
@@ -133,17 +175,46 @@
                     </span>
                 </div>
 
-                {% if paper.tldr %}
+                {% if paper.tldr or paper.method or paper.evidence or paper.why_for_me %}
                 <div class="paper-tldr">
-                    <strong>一句话总结：</strong> {{ paper.tldr }}
+                    {% if paper.tldr %}
+                    <div><strong>总结：</strong> {{ paper.tldr }}</div>
+                    {% endif %}
+                    {% if paper.method %}
+                    <div><strong>方法：</strong> {{ paper.method }}</div>
+                    {% endif %}
+                    {% if paper.evidence %}
+                    <div><strong>证据：</strong> {{ paper.evidence }}</div>
+                    {% endif %}
+                    {% if paper.why_for_me %}
+                    <div><strong>为什么适合我：</strong> {{ paper.why_for_me }}</div>
+                    {% endif %}
                 </div>
                 {% endif %}
 
-                {% if paper.abstract and not paper.tldr %}
-                <div class="paper-abstract">
-                    {{ paper.abstract[:500] }}{% if paper.abstract|length > 500 %}...{% endif %}
+                {% if paper.judge_reason %}
+                <div class="paper-reason">
+                    <strong>推荐理由：</strong> {{ paper.judge_reason }}
                 </div>
                 {% endif %}
+
+                {% if paper.abstract %}
+                <details class="paper-abstract">
+                    <summary>原摘要</summary>
+                    <p>{{ paper.abstract }}</p>
+                </details>
+                {% endif %}
+
+                <div class="feedback-row"
+                     data-url="{{ paper.url }}"
+                     data-date="{{ current_date or '' }}"
+                     data-title="{{ paper.title }}"
+                     data-tldr="{{ paper.tldr or '' }}"
+                     data-vote="{{ paper.feedback_vote or '' }}">
+                    <span class="feedback-label">这篇推荐</span>
+                    <button type="button" class="btn-feedback {% if paper.feedback_vote == 'relevant' %}active{% endif %}" data-vote="relevant">相关</button>
+                    <button type="button" class="btn-feedback {% if paper.feedback_vote == 'irrelevant' %}active{% endif %}" data-vote="irrelevant">不相关</button>
+                </div>
 
                 <div class="paper-links">
                     {% if paper.pdf_url %}
@@ -234,6 +305,7 @@
                                 <input type="text" name="llm_language" id="cfg_llm_language" value="Chinese">
                             </div>
                         </div>
+                        <p class="qa-hint" id="cfg_llm_models_hint"></p>
                         <button type="button" class="btn btn-secondary" onclick="testLLM()">Test Connection</button>
                         <span id="llm-test-result"></span>
                     </div>
@@ -317,18 +389,57 @@
         return { resp, data };
     }
 
-    async function fetchMutationJson(url, options = {}) {
-        const password = window.prompt('请输入操作密码以继续修改性操作：');
-        if (password === null) {
-            throw new Error('操作已取消');
+    const ADMIN_PASSWORD_KEY = 'arxivDailyAdminPassword';
+    let settingsReady = false;
+
+    function rememberedPassword() {
+        try {
+            return sessionStorage.getItem(ADMIN_PASSWORD_KEY) || '';
+        } catch (e) {
+            return '';
+        }
+    }
+
+    function rememberPassword(password) {
+        try {
+            sessionStorage.setItem(ADMIN_PASSWORD_KEY, password);
+        } catch (e) {
+            // Browsing still works if storage is unavailable.
+        }
+    }
+
+    function forgetPassword() {
+        try {
+            sessionStorage.removeItem(ADMIN_PASSWORD_KEY);
+        } catch (e) {
+            // Ignore storage failures.
+        }
+    }
+
+    async function fetchMutationJson(url, options = {}, forcePrompt = false) {
+        let password = forcePrompt ? '' : rememberedPassword();
+        if (!password) {
+            password = window.prompt('请输入操作密码以继续修改性操作：');
+            if (password === null) {
+                throw new Error('操作已取消');
+            }
         }
 
         const headers = new Headers(options.headers || {});
         headers.set('X-Admin-Password', password);
-        return await fetchJson(url, {
+        const result = await fetchJson(url, {
             ...options,
             headers,
         });
+        if (result.resp.status === 401) {
+            forgetPassword();
+            if (!forcePrompt) {
+                return await fetchMutationJson(url, options, true);
+            }
+            throw new Error(result.data?.detail || '操作密码不正确');
+        }
+        rememberPassword(password);
+        return result;
     }
 
     function setTaskState(data = {}) {
@@ -336,12 +447,16 @@
         const taskName = data.task_name || 'task';
         const runBtn = document.getElementById('runBtn');
         const backfillBtn = document.getElementById('backfillBtn');
+        const enrichBtn = document.getElementById('enrichBtn');
+        const qaBtn = document.getElementById('qaBtn');
         const reloadBtn = document.getElementById('reloadCorpusBtn');
         const banner = document.getElementById('taskBanner');
         const bannerText = document.getElementById('taskBannerText');
 
         runBtn.disabled = running;
         if (backfillBtn) backfillBtn.disabled = running;
+        if (enrichBtn) enrichBtn.disabled = running;
+        if (qaBtn) qaBtn.disabled = running;
         if (reloadBtn) reloadBtn.disabled = running;
 
         if (running) {
@@ -535,8 +650,13 @@
     }
 
     async function loadSettingsToForm() {
+        settingsReady = false;
         try {
-            const { data: cfg } = await fetchJson(API_BASE + '/api/config');
+            const { resp, data: cfg } = await fetchMutationJson(API_BASE + '/api/config/admin');
+            if (!resp.ok) {
+                showToast(cfg.detail || '无法加载设置', 'error');
+                return;
+            }
             document.getElementById('cfg_webdav_local_path').value = cfg.webdav?.local_path || '';
             document.getElementById('cfg_webdav_url').value = cfg.webdav?.url || '';
             document.getElementById('cfg_webdav_username').value = cfg.webdav?.username || '';
@@ -548,17 +668,27 @@
             document.getElementById('cfg_llm_base_url').value = cfg.llm?.base_url || 'https://api.openai.com/v1';
             document.getElementById('cfg_llm_model').value = cfg.llm?.model || 'gpt-4o-mini';
             document.getElementById('cfg_llm_language').value = cfg.llm?.language || 'Chinese';
+            const models = cfg.llm?.models || {};
+            const hint = document.getElementById('cfg_llm_models_hint');
+            if (hint) {
+                hint.textContent = `抽取 ${models.extract || cfg.llm?.model || '-'} · 摘要 ${models.summarize || cfg.llm?.model || '-'} · 裁判 ${models.judge || cfg.llm?.model || '-'}`;
+            }
             document.getElementById('cfg_schedule_hour').value = cfg.executor?.schedule_hour ?? 8;
             document.getElementById('cfg_schedule_minute').value = cfg.executor?.schedule_minute ?? 0;
             document.getElementById('cfg_max_paper_num').value = cfg.executor?.max_paper_num ?? 20;
             document.getElementById('cfg_timezone').value = cfg.executor?.timezone || 'Asia/Shanghai';
+            settingsReady = true;
         } catch(e) {
-            console.error('Failed to load settings:', e);
+            showToast('设置未加载：' + e.message, 'error');
         }
     }
 
     async function saveSettings(e) {
         e.preventDefault();
+        if (!settingsReady) {
+            showToast('设置还没加载成功，已取消保存，避免清空本地库路径。', 'error');
+            return;
+        }
         const categories = document.getElementById('cfg_arxiv_category').value
             .split(',').map(s => s.trim()).filter(Boolean);
 
@@ -756,6 +886,24 @@
                     container.appendChild(durationItem);
                 }
 
+                if (run.metrics?.llm_error_count != null) {
+                    const errorItem = document.createElement('div');
+                    errorItem.className = 'stat-item' + (run.metrics.llm_error_count ? ' stat-error' : '');
+                    errorItem.textContent = `LLM errors: ${run.metrics.llm_error_count}`;
+                    container.appendChild(errorItem);
+                }
+                if (run.metrics?.llm_warning) {
+                    const warningItem = document.createElement('div');
+                    warningItem.className = 'stat-item stat-error';
+                    warningItem.textContent = run.metrics.llm_warning;
+                    container.appendChild(warningItem);
+                }
+                if (run.metrics?.llm_prompt_tokens != null) {
+                    const tokenItem = document.createElement('div');
+                    tokenItem.className = 'stat-item';
+                    tokenItem.textContent = `Tokens: ${run.metrics.llm_prompt_tokens} in / ${run.metrics.llm_completion_tokens || 0} out`;
+                    container.appendChild(tokenItem);
+                }
                 if (run.metrics?.final_recommendations != null) {
                     const metricsItem = document.createElement('div');
                     metricsItem.className = 'stat-item';
@@ -780,6 +928,126 @@
             pollStatus();
         }
     })();
+
+    function selectedBackfillRange() {
+        setupBackfillDateInputs();
+        const today = todayDateString();
+        const startDate = document.getElementById('backfillStartDate').value;
+        const endDate = document.getElementById('backfillEndDate').value;
+        if (!startDate || !endDate) {
+            showToast('Please choose both dates.', 'error');
+            return null;
+        }
+        if (startDate > today || endDate > today) {
+            showToast('Dates cannot be later than today.', 'error');
+            return null;
+        }
+        if (startDate > endDate) {
+            showToast('Start date must be older than or equal to end date.', 'error');
+            return null;
+        }
+        return { startDate, endDate };
+    }
+
+    async function triggerEnrich() {
+        const range = selectedBackfillRange();
+        if (!range) return;
+        setTaskState({running: true, task_name: 'enrich saved papers'});
+        try {
+            const { resp, data } = await fetchMutationJson(API_BASE + '/api/enrich', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({start_date: range.startDate, end_date: range.endDate}),
+            });
+            if (resp.ok) {
+                showToast(`正在补全 ${range.startDate} 到 ${range.endDate} 的已入库论文，不会重新拉取 arXiv。`, 'success');
+                pollStatus();
+            } else {
+                showToast(data.detail || '补全失败', 'error');
+                await fetchTaskStatus();
+            }
+        } catch (e) {
+            showToast('Error: ' + e.message, 'error');
+            await fetchTaskStatus();
+        }
+    }
+
+    async function askQuestion() {
+        const question = document.getElementById('qaQuestion').value.trim();
+        const box = document.getElementById('qaAnswer');
+        if (!question) {
+            showToast('请先输入问题', 'error');
+            return;
+        }
+        box.textContent = '检索并回答中...';
+        try {
+            const { resp, data } = await fetchMutationJson(API_BASE + '/api/qa', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({question}),
+            });
+            if (!resp.ok) {
+                box.textContent = data.detail || '问答失败';
+                return;
+            }
+            box.replaceChildren();
+            const answer = document.createElement('p');
+            answer.textContent = data.answer || '';
+            box.appendChild(answer);
+            const sources = data.sources || [];
+            if (sources.length) {
+                const list = document.createElement('ul');
+                for (const source of sources) {
+                    const item = document.createElement('li');
+                    if (source.url) {
+                        const link = document.createElement('a');
+                        link.href = source.url;
+                        link.target = '_blank';
+                        link.rel = 'noopener noreferrer';
+                        link.textContent = source.title || source.url;
+                        item.appendChild(link);
+                    } else {
+                        item.textContent = (source.title || '语料') + '（语料）';
+                    }
+                    list.appendChild(item);
+                }
+                box.appendChild(list);
+            }
+        } catch (e) {
+            box.textContent = e.message;
+        }
+    }
+
+    document.addEventListener('click', async (event) => {
+        const button = event.target.closest('.btn-feedback');
+        if (!button) return;
+        const row = button.closest('.feedback-row');
+        if (!row?.dataset.url) return;
+        try {
+            const { resp, data } = await fetchMutationJson(API_BASE + '/api/feedback', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    url: row.dataset.url,
+                    vote: button.dataset.vote,
+                    date: row.dataset.date || '',
+                    title: row.dataset.title || '',
+                    tldr: row.dataset.tldr || '',
+                }),
+            });
+            if (!resp.ok) {
+                showToast(data.detail || '反馈失败', 'error');
+                return;
+            }
+            row.dataset.vote = button.dataset.vote;
+            row.querySelectorAll('.btn-feedback').forEach((element) => {
+                element.classList.toggle('active', element.dataset.vote === button.dataset.vote);
+            });
+            showToast(button.dataset.vote === 'relevant' ? '已记为相关，下次更新画像时会采用' : '已记为不相关，下次更新画像时会避开', 'success');
+        } catch (e) {
+            showToast(e.message, 'error');
+        }
+    });
 
     document.addEventListener('keydown', (event) => {
         if (event.key === 'Escape' && document.getElementById('settingsModal').classList.contains('active')) {
