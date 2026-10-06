@@ -434,65 +434,91 @@ def _parse_json_list(text: str, max_items: int = 20) -> list[str]:
     return []
 
 
-def _strip_code_fences(content: str) -> str:
-    content = content.strip()
-    if not content.startswith("```"):
-        return content
+_CODE_FENCE_RE = re.compile(r"```(?:json|JSON)?[ \t]*\r?\n?([\s\S]*?)```", re.IGNORECASE)
 
-    lines = content.splitlines()
-    if len(lines) >= 2 and lines[-1].strip() == "```":
-        return "\n".join(lines[1:-1]).strip()
-    return content
+
+def _strip_code_fences(content: str) -> str:
+    """Drop markdown fences wherever they appear, keeping the fenced text."""
+    content = content.strip()
+    if "```" not in content:
+        return content
+    stripped = _CODE_FENCE_RE.sub(lambda match: match.group(1), content)
+    stripped = re.sub(r"```(?:json|JSON)?", "", stripped, flags=re.IGNORECASE)
+    return stripped.strip()
+
+
+def _prepare_json_text(content: str) -> str:
+    return _strip_code_fences(_remove_think_tags(content or ""))
+
+
+def _scan_balanced_json(content: str, start: int) -> str | None:
+    opener = content[start]
+    if opener not in "{[":
+        return None
+    closers = {"{": "}", "[": "]"}
+    stack = [opener]
+    in_string = False
+    escape = False
+    for index in range(start + 1, len(content)):
+        char = content[index]
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        if char in "{[":
+            stack.append(char)
+            continue
+        if char in "}]":
+            if not stack or closers[stack[-1]] != char:
+                return None
+            stack.pop()
+            if not stack:
+                return content[start : index + 1]
+    return None
+
+
+def _iter_json_values(content: str):
+    prepared = _prepare_json_text(content)
+    if not prepared:
+        return
+    try:
+        whole = json.loads(prepared)
+    except json.JSONDecodeError:
+        whole = None
+    if isinstance(whole, (dict, list)):
+        yield whole
+        return
+    for index, char in enumerate(prepared):
+        if char not in "{[":
+            continue
+        candidate = _scan_balanced_json(prepared, index)
+        if not candidate:
+            continue
+        try:
+            value = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, (dict, list)):
+            yield value
+
+
+def _extract_json_value(content: str) -> dict[str, Any] | list[Any] | None:
+    for value in _iter_json_values(content):
+        return value
+    return None
 
 
 def _extract_json_object(content: str) -> dict[str, Any] | None:
-    if not content:
-        return None
-
-    content = _strip_code_fences(content)
-
-    try:
-        result = json.loads(content)
-        if isinstance(result, dict):
-            return result
-    except json.JSONDecodeError:
-        pass
-
-    for start in range(len(content)):
-        if content[start] != "{":
-            continue
-
-        depth = 0
-        in_string = False
-        escape = False
-
-        for end in range(start, len(content)):
-            char = content[end]
-
-            if in_string:
-                if escape:
-                    escape = False
-                elif char == "\\":
-                    escape = True
-                elif char == '"':
-                    in_string = False
-                continue
-
-            if char == '"':
-                in_string = True
-            elif char == "{":
-                depth += 1
-            elif char == "}":
-                depth -= 1
-                if depth == 0:
-                    candidate = content[start : end + 1]
-                    try:
-                        result = json.loads(candidate)
-                        if isinstance(result, dict):
-                            return result
-                    except json.JSONDecodeError:
-                        break
-
+    for value in _iter_json_values(content):
+        if isinstance(value, dict):
+            return value
     return None
 
 
@@ -585,8 +611,11 @@ def _call_json(
         note_llm_error(f"{role} 调用失败：{exc}")
         logger.warning(f"LLM {role} call failed: {exc}")
         return None
-    parsed = _extract_json_object(content)
-    if parsed is None:
+    parsed = _extract_json_value(content)
+    # Some models emit a bare array instead of {"items": [...]}.
+    if isinstance(parsed, list):
+        parsed = {"items": parsed}
+    if not isinstance(parsed, dict):
         note_llm_error(f"{role} 返回的 JSON 无法解析")
         logger.warning(f"Failed to parse {role} JSON. Raw response: {content[:500]!r}")
         return None
@@ -737,15 +766,9 @@ def judge_papers(
     return normalized
 
 
-def generate_tldrs_batch(
-    papers: list[Any],
-    profile: dict[str, Any] | None,
-    config: dict[str, Any],
-) -> dict[str, dict[str, str]] | None:
-    if not papers:
-        return {}
-    language = _language(config)
-    profile = profile or {}
+def _tldr_prompt(
+    papers: list[Any], profile: dict[str, Any], language: str
+) -> str:
     blocks = []
     for index, paper in enumerate(papers):
         blocks.append(
@@ -760,40 +783,87 @@ def generate_tldrs_batch(
     interest = _clip(str(profile.get("summary") or ""), 300) or "、".join(
         _string_list(profile.get("topics"), 6)
     )
-    prompt = (
+    return (
         f"为下面每一篇论文写结构化中文短评。语言：{language}。\n"
         "每篇都要有 tldr、method、evidence、why_for_me，各用一句，大约 40 到 80 个汉字。\n"
         f"读者兴趣：{interest or '未提供'}\n\n"
         + "\n\n".join(blocks)
         + '\n\n只返回 JSON：{"items":[{"id":"","tldr":"","method":"","evidence":"","why_for_me":""}]}'
     )
-    parsed = _call_json(
-        config,
-        role="summarize",
-        system=f"你为研究者写短评，只返回 JSON，使用{language}。",
-        user=prompt,
-        max_tokens=2800,
-    )
-    if not parsed:
-        return None
+
+
+def _collect_tldr_items(parsed: dict[str, Any] | None) -> dict[str, dict[str, str]]:
+    if not isinstance(parsed, dict):
+        return {}
     items = parsed.get("items")
     if not isinstance(items, list):
-        note_llm_error("TLDR 结果缺少 items 数组")
-        return None
+        if parsed.get("tldr"):
+            items = [parsed]
+        else:
+            return {}
     result: dict[str, dict[str, str]] = {}
     for item in items:
         if not isinstance(item, dict):
             continue
         item_id = str(item.get("id") or "").strip()
         tldr = _clip(str(item.get("tldr") or ""), 220)
-        if not item_id or not tldr:
+        if not tldr:
             continue
+        if not item_id:
+            item_id = f"__anon_{len(result)}"
         result[item_id] = {
             "tldr": tldr,
             "method": _clip(str(item.get("method") or ""), 220),
             "evidence": _clip(str(item.get("evidence") or ""), 220),
             "why_for_me": _clip(str(item.get("why_for_me") or ""), 220),
         }
+    return result
+
+
+def _tldr_max_tokens(paper_count: int) -> int:
+    # A 10-paper batch at 2800 tokens stopped inside the reasoning trace.
+    return min(12000, 1200 + 700 * max(1, paper_count))
+
+
+def _request_tldr_items(
+    papers: list[Any], profile: dict[str, Any], config: dict[str, Any]
+) -> dict[str, dict[str, str]]:
+    language = _language(config)
+    parsed = _call_json(
+        config,
+        role="summarize",
+        system=f"你为研究者写短评，只返回 JSON，使用{language}。",
+        user=_tldr_prompt(papers, profile, language),
+        max_tokens=_tldr_max_tokens(len(papers)),
+    )
+    return _collect_tldr_items(parsed)
+
+
+def generate_tldrs_batch(
+    papers: list[Any],
+    profile: dict[str, Any] | None,
+    config: dict[str, Any],
+) -> dict[str, dict[str, str]] | None:
+    if not papers:
+        return {}
+    profile = profile or {}
+    result = _request_tldr_items(papers, profile, config)
+    if len(papers) > 1:
+        missing = [
+            (index, paper)
+            for index, paper in enumerate(papers)
+            if _paper_id(paper, index) not in result
+        ]
+        if missing:
+            logger.info(f"Retrying {len(missing)} TLDR item(s) individually")
+            for index, paper in missing:
+                paper_id = _paper_id(paper, index)
+                one = _request_tldr_items([paper], profile, config)
+                payload = one.get(paper_id) or one.get(_paper_id(paper, 0))
+                if payload is None and len(one) == 1:
+                    payload = next(iter(one.values()))
+                if payload and payload.get("tldr"):
+                    result[paper_id] = payload
     if not result:
         note_llm_error("TLDR 结果没有可用条目")
         return None

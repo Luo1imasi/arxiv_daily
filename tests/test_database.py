@@ -4,6 +4,7 @@ import tempfile
 import unittest
 
 from arxiv_daily import database as db
+from arxiv_daily.protocol import Paper
 
 
 class DatabaseMaintenanceTests(unittest.IsolatedAsyncioTestCase):
@@ -112,6 +113,59 @@ class DatabaseMaintenanceTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertEqual(len(rows), 1)
                 self.assertEqual(rows[0]["vote"], "irrelevant")
+            finally:
+                if old_data_dir is None:
+                    os.environ.pop("ARXIV_DAILY_DATA", None)
+                else:
+                    os.environ["ARXIV_DAILY_DATA"] = old_data_dir
+
+    async def test_update_paper_summaries_keeps_other_columns(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_data_dir = os.environ.get("ARXIV_DAILY_DATA")
+            os.environ["ARXIV_DAILY_DATA"] = tmpdir
+            try:
+                await db.init_db()
+                await db.save_papers(
+                    [
+                        Paper(
+                            source="arxiv",
+                            title="Robot paper",
+                            authors=["Ada"],
+                            abstract="An abstract",
+                            url="https://example.com/robot",
+                            score=4.2,
+                            judge_relevance=5,
+                            judge_reason="相关",
+                            judge_keep=True,
+                        )
+                    ],
+                    "2026-10-06",
+                )
+                paper = Paper(
+                    source="arxiv",
+                    title="ignored",
+                    authors=[],
+                    abstract="",
+                    url="https://example.com/robot",
+                    tldr="中文短评",
+                    method="方法",
+                    evidence="证据",
+                    why_for_me="适合",
+                )
+
+                updated = await db.update_paper_summaries("2026-10-06", [paper])
+                rows = await db.get_papers_by_date("2026-10-06")
+                empty_dates = await db.list_dates_with_empty_tldr("2026-10-01")
+
+                self.assertEqual(updated, 1)
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["title"], "Robot paper")
+                self.assertEqual(rows[0]["tldr"], "中文短评")
+                self.assertEqual(rows[0]["method"], "方法")
+                self.assertEqual(rows[0]["score"], 4.2)
+                self.assertEqual(rows[0]["judge_reason"], "相关")
+                self.assertEqual(rows[0]["judge_keep"], 1)
+                self.assertEqual(empty_dates, [])
             finally:
                 if old_data_dir is None:
                     os.environ.pop("ARXIV_DAILY_DATA", None)

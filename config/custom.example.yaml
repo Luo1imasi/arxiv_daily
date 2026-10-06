@@ -20,7 +20,7 @@ llm:
   model: "deepseek-flash"
   models:
     extract: "deepseek-flash"
-    summarize: "deepseek-flash"
+    summarize: "glm-5.3-flash"
     judge: "grok-4.7"
   language: "Chinese"
 

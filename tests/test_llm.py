@@ -1,10 +1,15 @@
 import unittest
 from types import SimpleNamespace
 
+from unittest.mock import patch
+
 from arxiv_daily.llm import (
     LLMCallError,
+    _call_json,
     _create_completion,
     _extract_json_object,
+    _extract_json_value,
+    generate_tldrs_batch,
     make_llm_cache_key,
     message_text,
     resolve_model,
@@ -36,6 +41,31 @@ class ExtractJsonObjectTests(unittest.TestCase):
         self.assertEqual(
             _extract_json_object('{"tldr": "Uses {tokens} safely in output."}'),
             {"tldr": "Uses {tokens} safely in output."},
+        )
+
+    def test_strips_think_block_and_mid_text_code_fence(self):
+        content = (
+            '<think>We need {"tldr": "decoy"}</think>\n'
+            '结果如下：\n```json\n{"tldr": "中文总结"}\n```\n完毕'
+        )
+        self.assertEqual(_extract_json_object(content), {"tldr": "中文总结"})
+
+    def test_skips_broken_prefix_and_reads_first_valid_object(self):
+        self.assertEqual(
+            _extract_json_object('We need {not json}\n{"tldr": "好的总结"} trailing'),
+            {"tldr": "好的总结"},
+        )
+
+    def test_extracts_first_complete_array(self):
+        self.assertEqual(
+            _extract_json_value('note [{"id": "a", "tldr": "甲"}] {"id": "b"}'),
+            [{"id": "a", "tldr": "甲"}],
+        )
+
+    def test_object_extractor_skips_a_leading_array(self):
+        self.assertEqual(
+            _extract_json_object('note [1, 2] {"tldr": "后面的对象"}'),
+            {"tldr": "后面的对象"},
         )
 
 
@@ -164,6 +194,179 @@ class CompletionRetryTests(unittest.TestCase):
         )
 
         self.assertEqual(calls, ["max_tokens", "max_completion_tokens"])
+
+
+class CallJsonTests(unittest.TestCase):
+    def test_requests_json_object_and_unwraps_think_fence(self):
+        captured = {}
+
+        def fake(config, messages, max_tokens=4096, *, role, temperature, response_format):
+            del config, messages, max_tokens, role
+            captured["temperature"] = temperature
+            captured["response_format"] = response_format
+            return '<think>We need to answer</think>\n```json\n{"tldr": "中文总结"}\n```'
+
+        with patch("arxiv_daily.llm._call_llm_api_with_retry", side_effect=fake):
+            parsed = _call_json(
+                {},
+                role="summarize",
+                system="只返回 JSON",
+                user="写短评",
+                max_tokens=32,
+            )
+
+        self.assertEqual(parsed, {"tldr": "中文总结"})
+        self.assertEqual(captured["response_format"], {"type": "json_object"})
+        self.assertEqual(captured["temperature"], 0)
+
+    def test_wraps_a_bare_json_array_as_items(self):
+        def fake(config, messages, max_tokens=4096, *, role, temperature, response_format):
+            del config, messages, max_tokens, role, temperature, response_format
+            return '[{"id": "http://example.test/a", "tldr": "甲"}]'
+
+        with patch("arxiv_daily.llm._call_llm_api_with_retry", side_effect=fake):
+            parsed = _call_json({}, role="summarize", system="s", user="u", max_tokens=32)
+
+        self.assertEqual(parsed, {"items": [{"id": "http://example.test/a", "tldr": "甲"}]})
+
+
+def _tldr_paper(url: str):
+    return SimpleNamespace(title=f"Title {url}", abstract="Abstract", url=url)
+
+
+def _ids(prompt: str) -> list[str]:
+    import re
+
+    return re.findall(r"(?m)^id: (\S+)", prompt)
+
+
+class BatchTldrRetryTests(unittest.TestCase):
+    def test_failed_batch_retries_each_paper_once(self):
+        papers = [_tldr_paper("http://example.test/a"), _tldr_paper("http://example.test/b")]
+        calls: list[str] = []
+
+        def fake(config, *, role, system, user, max_tokens):
+            del config, role, system, max_tokens
+            calls.append(user)
+            ids = _ids(user)
+            if len(ids) != 1:
+                return None
+            return {
+                "items": [
+                    {
+                        "id": ids[0],
+                        "tldr": "这是一篇中文短评",
+                        "method": "方法",
+                        "evidence": "证据",
+                        "why_for_me": "相关",
+                    }
+                ]
+            }
+
+        with patch("arxiv_daily.llm._call_json", side_effect=fake):
+            result = generate_tldrs_batch(papers, None, {"llm": {"language": "Chinese"}})
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(set(result), {"http://example.test/a", "http://example.test/b"})
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(_ids(calls[0])), 2)
+        self.assertEqual([len(_ids(call)) for call in calls[1:]], [1, 1])
+
+    def test_partial_batch_retries_only_missing_paper(self):
+        papers = [_tldr_paper("http://example.test/a"), _tldr_paper("http://example.test/b")]
+        calls: list[list[str]] = []
+
+        def fake(config, *, role, system, user, max_tokens):
+            del config, role, system, max_tokens
+            ids = _ids(user)
+            calls.append(ids)
+            if len(ids) > 1:
+                return {
+                    "items": [
+                        {
+                            "id": ids[0],
+                            "tldr": "第一篇中文短评",
+                            "method": "方法",
+                            "evidence": "证据",
+                            "why_for_me": "相关",
+                        }
+                    ]
+                }
+            return {
+                "items": [
+                    {
+                        "id": ids[0],
+                        "tldr": "第二篇中文短评",
+                        "method": "方法",
+                        "evidence": "证据",
+                        "why_for_me": "相关",
+                    }
+                ]
+            }
+
+        with patch("arxiv_daily.llm._call_json", side_effect=fake):
+            result = generate_tldrs_batch(papers, None, {"llm": {"language": "Chinese"}})
+
+        self.assertEqual(calls, [
+            ["http://example.test/a", "http://example.test/b"],
+            ["http://example.test/b"],
+        ])
+        assert result is not None
+        self.assertEqual(result["http://example.test/a"]["tldr"], "第一篇中文短评")
+        self.assertEqual(result["http://example.test/b"]["tldr"], "第二篇中文短评")
+
+    def test_complete_batch_does_not_retry(self):
+        papers = [_tldr_paper("http://example.test/a"), _tldr_paper("http://example.test/b")]
+        calls = {"count": 0}
+
+        def fake(config, *, role, system, user, max_tokens):
+            del config, role, system, max_tokens
+            calls["count"] += 1
+            return {
+                "items": [
+                    {
+                        "id": item_id,
+                        "tldr": "中文短评",
+                        "method": "方法",
+                        "evidence": "证据",
+                        "why_for_me": "相关",
+                    }
+                    for item_id in _ids(user)
+                ]
+            }
+
+        with patch("arxiv_daily.llm._call_json", side_effect=fake):
+            result = generate_tldrs_batch(papers, None, {"llm": {"language": "Chinese"}})
+
+        self.assertEqual(calls["count"], 1)
+        assert result is not None
+        self.assertEqual(len(result), 2)
+
+    def test_batch_token_budget_grows_with_paper_count(self):
+        from arxiv_daily.llm import _tldr_max_tokens
+
+        self.assertLess(_tldr_max_tokens(1), _tldr_max_tokens(10))
+        self.assertGreaterEqual(_tldr_max_tokens(10), 8000)
+        self.assertLessEqual(_tldr_max_tokens(40), 12000)
+
+    def test_single_paper_failure_is_not_retried_inside_batch(self):
+        calls = {"count": 0}
+
+        def fake(config, *, role, system, user, max_tokens):
+            del config, role, system, user, max_tokens
+            calls["count"] += 1
+            return None
+
+        with patch("arxiv_daily.llm._call_json", side_effect=fake):
+            result = generate_tldrs_batch(
+                [_tldr_paper("http://example.test/a")],
+                None,
+                {"llm": {"language": "Chinese"}},
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(calls["count"], 1)
 
 
 if __name__ == "__main__":

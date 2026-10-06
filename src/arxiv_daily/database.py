@@ -678,6 +678,59 @@ async def save_candidate_enrichments(
     logger.info(f"Cached {len(payload)} candidate enrichment entries")
 
 
+async def update_paper_summaries(
+    date: str, papers: list[Any], db_path: Optional[str] = None
+) -> int:
+    """Write TLDR fields for papers already stored on a date. Other columns stay."""
+    if not papers:
+        return 0
+    updated = 0
+    async with _connect(db_path) as db:
+        for paper in papers:
+            url = getattr(paper, "url", None)
+            tldr = getattr(paper, "tldr", None)
+            if not url or not str(tldr or "").strip():
+                continue
+            cursor = await db.execute(
+                """UPDATE papers
+                   SET tldr = ?, method = ?, evidence = ?, why_for_me = ?
+                   WHERE date = ? AND url = ?""",
+                (
+                    tldr,
+                    getattr(paper, "method", None),
+                    getattr(paper, "evidence", None),
+                    getattr(paper, "why_for_me", None),
+                    date,
+                    url,
+                ),
+            )
+            updated += int(cursor.rowcount or 0)
+        await db.commit()
+    logger.info(f"Updated TLDR for {updated} papers on {date}")
+    return updated
+
+
+async def list_dates_with_empty_tldr(
+    since: str | None = None, db_path: Optional[str] = None
+) -> list[str]:
+    async with _connect(db_path) as db:
+        if since:
+            cursor = await db.execute(
+                """SELECT DISTINCT date FROM papers
+                   WHERE date >= ? AND (tldr IS NULL OR TRIM(tldr) = '')
+                   ORDER BY date ASC""",
+                (since,),
+            )
+        else:
+            cursor = await db.execute(
+                """SELECT DISTINCT date FROM papers
+                   WHERE tldr IS NULL OR TRIM(tldr) = ''
+                   ORDER BY date ASC"""
+            )
+        rows = await cursor.fetchall()
+        return [row[0] for row in rows]
+
+
 async def get_papers_by_date(date: str, db_path: Optional[str] = None) -> list[dict[str, Any]]:
     async with _connect(db_path, row_factory=True) as db:
         cursor = await db.execute(

@@ -642,7 +642,59 @@ async def get_stats():
     )
 
 
-def main():
+def _cli_backfill_tldr(args: Any) -> None:
+    import asyncio
+
+    from .executor import plan_tldr_backfill
+
+    config = load_config()
+    explicit = [str(value) for value in (args.date or [])]
+    recent: list[str] = []
+    if args.recent_days:
+        if args.recent_days < 1:
+            raise SystemExit("--recent-days must be at least 1")
+        start = (get_business_date(config) - timedelta(days=args.recent_days)).isoformat()
+        recent = asyncio.run(db.list_dates_with_empty_tldr(start))
+    if not explicit and not recent:
+        raise SystemExit("pass --date and/or --recent-days")
+    plan = plan_tldr_backfill(explicit, recent, only_empty=bool(args.only_empty))
+    result = asyncio.run(Executor(config).backfill_tldrs(plan))
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    if result.get("status") != "completed":
+        raise SystemExit(1)
+
+
+def main(argv: list[str] | None = None) -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="arxiv-daily")
+    sub = parser.add_subparsers(dest="command")
+    backfill = sub.add_parser(
+        "backfill-tldr",
+        help="Regenerate TLDRs for recommendations already saved in the database",
+    )
+    backfill.add_argument(
+        "--date",
+        action="append",
+        default=[],
+        help="Business date to regenerate, YYYY-MM-DD. Can be repeated.",
+    )
+    backfill.add_argument(
+        "--recent-days",
+        type=int,
+        default=0,
+        help="Also fill empty TLDRs on dates within this many days of the business date.",
+    )
+    backfill.add_argument(
+        "--only-empty",
+        action="store_true",
+        help="On --date, skip papers that already have a TLDR.",
+    )
+    args = parser.parse_args(argv)
+    if args.command == "backfill-tldr":
+        _cli_backfill_tldr(args)
+        return
+
     import uvicorn
 
     config = load_config()

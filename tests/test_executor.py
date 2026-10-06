@@ -5,6 +5,7 @@ import unittest
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import cast, override
+from unittest.mock import patch
 
 from arxiv_daily import database as db
 from arxiv_daily import webdav as webdav_module
@@ -16,6 +17,7 @@ from arxiv_daily.executor import (
     _filter_seen_papers,
     _profile_signatures,
     _select_judged_papers,
+    plan_tldr_backfill,
 )
 from arxiv_daily.protocol import CorpusPaper
 from arxiv_daily.protocol import Paper
@@ -605,6 +607,132 @@ class BackfillRunTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(ValueError, "older date"):
             await executor.run_between_dates("2026-04-23", "2026-04-21")
+
+
+class TldrBackfillPlanTests(unittest.TestCase):
+    def test_explicit_date_is_regenerated_and_recent_empty_dates_are_filled(self):
+        plan = plan_tldr_backfill(
+            ["2026-10-06", "2026-10-06"],
+            ["2026-10-06", "2026-10-05", "2026-10-04"],
+        )
+
+        self.assertEqual(
+            plan,
+            [
+                ("2026-10-04", True),
+                ("2026-10-05", True),
+                ("2026-10-06", False),
+            ],
+        )
+
+    def test_only_empty_flag_applies_to_explicit_dates(self):
+        self.assertEqual(
+            plan_tldr_backfill(["2026-10-06"], [], only_empty=True),
+            [("2026-10-06", True)],
+        )
+
+
+class SavedTldrBackfillTests(unittest.IsolatedAsyncioTestCase):
+    async def test_backfill_updates_tldr_without_rewriting_the_day(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_data_dir = os.environ.get("ARXIV_DAILY_DATA")
+            os.environ["ARXIV_DAILY_DATA"] = tmpdir
+            try:
+                await db.init_db()
+                kept = Paper(
+                    source="arxiv",
+                    title="Already summarized",
+                    authors=["Ada"],
+                    abstract="Keep this row.",
+                    url="https://example.com/kept",
+                    tldr="已有短评",
+                    score=1.5,
+                    judge_relevance=4,
+                    judge_reason="相关",
+                    judge_keep=True,
+                )
+                empty = Paper(
+                    source="arxiv",
+                    title="Needs a summary",
+                    authors=["Ada"],
+                    abstract="Empty TLDR.",
+                    url="https://example.com/empty",
+                    score=2.5,
+                    judge_relevance=5,
+                    judge_reason="很相关",
+                    judge_keep=True,
+                )
+                today = Paper(
+                    source="arxiv",
+                    title="Regenerate me",
+                    authors=["Ada"],
+                    abstract="Old summary should be replaced.",
+                    url="https://example.com/today",
+                    tldr="旧短评",
+                    score=3.5,
+                    judge_relevance=3,
+                    judge_reason="一般",
+                    judge_keep=False,
+                )
+                await db.save_papers([kept, empty], "2026-10-05")
+                await db.save_papers([today], "2026-10-06")
+                seen: list[list[str]] = []
+
+                def fake_generate(papers, profile, config):
+                    del profile, config
+                    seen.append([paper.url for paper in papers])
+                    return {
+                        paper.url: {
+                            "tldr": f"新短评 {paper.url.rsplit('/', 1)[-1]}",
+                            "method": "方法",
+                            "evidence": "证据",
+                            "why_for_me": "相关",
+                        }
+                        for paper in papers
+                    }
+
+                executor = Executor(
+                    {
+                        "llm": {
+                            "api_key": "test-key",
+                            "base_url": "http://127.0.0.1:8080/v1",
+                            "model": "glm-5.3-flash",
+                            "language": "Chinese",
+                            "models": {"summarize": "glm-5.3-flash"},
+                        }
+                    }
+                )
+                with (
+                    patch("arxiv_daily.executor.fetch_corpus", side_effect=AssertionError("arxiv")),
+                    patch("arxiv_daily.executor.db.save_papers", side_effect=AssertionError("rewrite")),
+                    patch("arxiv_daily.executor.generate_tldrs_batch", side_effect=fake_generate),
+                ):
+                    result = await executor.backfill_tldrs(
+                        [("2026-10-05", True), ("2026-10-06", False)]
+                    )
+
+                self.assertEqual(result["status"], "completed")
+                self.assertEqual(result["updated"], 2)
+                self.assertEqual(seen, [["https://example.com/empty"], ["https://example.com/today"]])
+                older = {row["url"]: row for row in await db.get_papers_by_date("2026-10-05")}
+                current = {row["url"]: row for row in await db.get_papers_by_date("2026-10-06")}
+                self.assertEqual(older["https://example.com/kept"]["tldr"], "已有短评")
+                self.assertEqual(older["https://example.com/kept"]["judge_reason"], "相关")
+                self.assertEqual(older["https://example.com/empty"]["tldr"], "新短评 empty")
+                self.assertEqual(older["https://example.com/empty"]["judge_relevance"], 5)
+                self.assertEqual(older["https://example.com/empty"]["score"], 2.5)
+                self.assertEqual(current["https://example.com/today"]["tldr"], "新短评 today")
+                self.assertEqual(current["https://example.com/today"]["method"], "方法")
+                self.assertEqual(current["https://example.com/today"]["judge_reason"], "一般")
+                self.assertEqual(current["https://example.com/today"]["score"], 3.5)
+                cached = await db.load_candidate_enrichments(["https://example.com/today"])
+                self.assertEqual(cached["https://example.com/today"]["tldr"], "新短评 today")
+                self.assertIn("glm-5.3-flash", cached["https://example.com/today"]["llm_cache_key"])
+            finally:
+                if old_data_dir is None:
+                    os.environ.pop("ARXIV_DAILY_DATA", None)
+                else:
+                    os.environ["ARXIV_DAILY_DATA"] = old_data_dir
 
 
 if __name__ == "__main__":

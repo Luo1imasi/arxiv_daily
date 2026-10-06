@@ -764,6 +764,110 @@ class Executor:
         _merge_llm_usage(self.last_run_metrics)
         return self.last_run_metrics
 
+    async def backfill_tldrs(self, plan: list[tuple[str, bool]]) -> dict[str, object]:
+        """Regenerate TLDRs for papers already stored. Does not fetch arXiv or re-judge."""
+        reset_llm_usage()
+        summaries: list[dict[str, object]] = []
+        if not self.config.get("llm", {}).get("api_key"):
+            note_llm_error("未配置 LLM API key，无法补写 TLDR")
+            return {"status": "llm_unavailable", "dates": summaries, **get_llm_usage()}
+
+        profile_row = await db.load_interest_profile()
+        profile = (profile_row or {}).get("profile") if profile_row else None
+        loop = asyncio.get_running_loop()
+        for business_date, only_empty in plan:
+            rows = await db.get_papers_by_date(business_date)
+            papers = [_paper_from_row(row) for row in rows]
+            if only_empty:
+                papers = [paper for paper in papers if not (paper.tldr or "").strip()]
+            if not papers:
+                summaries.append(
+                    {"date": business_date, "selected": 0, "updated": 0, "only_empty": only_empty}
+                )
+                continue
+            generated = await loop.run_in_executor(
+                get_executor_pool(self.config),
+                lambda papers=papers: generate_tldrs_batch(papers, profile, self.config),
+            )
+            generated = generated or {}
+            updated_papers: list[Paper] = []
+            for index, paper in enumerate(papers):
+                payload = generated.get(paper.url or "") or generated.get(f"paper-{index + 1}")
+                if payload is None and len(papers) == 1 and len(generated) == 1:
+                    payload = next(iter(generated.values()))
+                if not payload or not payload.get("tldr"):
+                    continue
+                paper.tldr = payload["tldr"]
+                paper.method = payload.get("method") or None
+                paper.evidence = payload.get("evidence") or None
+                paper.why_for_me = payload.get("why_for_me") or None
+                updated_papers.append(paper)
+            count = await db.update_paper_summaries(business_date, updated_papers)
+            cache_key = _get_llm_cache_key(self.config, "summarize")
+            await db.save_candidate_enrichments(
+                [
+                    {
+                        "url": paper.url,
+                        "pdf_url": paper.pdf_url,
+                        "content_key": _content_key(paper),
+                        "tldr": paper.tldr,
+                        "method": paper.method,
+                        "evidence": paper.evidence,
+                        "why_for_me": paper.why_for_me,
+                        "llm_cache_key": cache_key,
+                    }
+                    for paper in updated_papers
+                    if paper.url
+                ]
+            )
+            summaries.append(
+                {
+                    "date": business_date,
+                    "selected": len(papers),
+                    "updated": count,
+                    "only_empty": only_empty,
+                }
+            )
+            logger.info(
+                f"Backfilled TLDR for {count}/{len(papers)} saved papers on {business_date}"
+            )
+        result: dict[str, object] = {
+            "status": "completed",
+            "dates": summaries,
+            "updated": sum(int(item["updated"]) for item in summaries),
+        }
+        _merge_llm_usage(result)
+        return result
+
+
+def plan_tldr_backfill(
+    explicit_dates: list[str],
+    recent_empty_dates: list[str],
+    *,
+    only_empty: bool = False,
+) -> list[tuple[str, bool]]:
+    """Return (date, only_empty) for a TLDR backfill.
+
+    Dates passed explicitly are regenerated unless only_empty is set.
+    Recent dates only fill recommendations whose TLDR is still empty.
+    """
+    plan: list[tuple[str, bool]] = []
+    seen: set[str] = set()
+    for value in explicit_dates:
+        day = _normalize_business_date(value)
+        if day in seen:
+            continue
+        seen.add(day)
+        plan.append((day, only_empty))
+    for value in recent_empty_dates:
+        day = _normalize_business_date(value)
+        if day in seen:
+            continue
+        seen.add(day)
+        plan.append((day, True))
+    plan.sort(key=lambda item: item[0])
+    return plan
+
 
 def _paper_from_row(row: dict[str, Any]) -> Paper:
     authors = row.get("authors")
