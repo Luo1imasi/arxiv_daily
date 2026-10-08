@@ -582,6 +582,10 @@ select:focus-visible {
     flex-wrap: wrap;
 }
 
+.paper-card[id] {
+    scroll-margin-top: 190px;
+}
+
 .btn-zotero {
     font-family: inherit;
     border: 1px solid var(--primary);

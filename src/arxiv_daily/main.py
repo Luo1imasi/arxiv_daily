@@ -10,7 +10,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
@@ -423,6 +423,84 @@ async def task_status():
 @app.get("/api/config")
 async def get_config():
     return JSONResponse(public_config(_app_config))
+
+
+def _public_read_headers(request: Request) -> dict[str, str]:
+    headers = {"Cache-Control": "public, max-age=60", "Vary": "Origin"}
+    origin = request.headers.get("origin")
+    if origin in get_config_value(_app_config, "server.widget_allowed_origins"):
+        headers["Access-Control-Allow-Origin"] = origin
+    return headers
+
+
+@app.get("/api/widget")
+async def latest_widget(request: Request, limit: int = Query(3, ge=1, le=5)):
+    dates = await db.get_all_dates()
+    latest_date = dates[0] if dates else None
+    rows = await db.get_papers_by_date(latest_date) if latest_date else []
+    return JSONResponse({
+        "date": latest_date,
+        "total": len(rows),
+        "papers": [{
+            "id": row["id"],
+            "title": row["title"],
+            "tldr": str(row.get("tldr") or "")[:320],
+            "score": row.get("judge_relevance") if row.get("judge_relevance") is not None else row.get("score"),
+            "score_max": 5 if row.get("judge_relevance") is not None else 10,
+            "detail_url": f"https://arxiv.luolimasi.xyz/date/{latest_date}#paper-{row['id']}",
+        } for row in rows[:limit]],
+    }, headers=_public_read_headers(request))
+
+
+@app.get("/api/terminal")
+async def terminal_papers(
+    request: Request,
+    date: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    q: str | None = Query(None, min_length=1, max_length=120),
+    limit: int = Query(5, ge=1, le=10),
+):
+    headers = _public_read_headers(request)
+    dates = await db.get_all_dates()
+    if q is not None and (not q.strip() or date is not None):
+        return JSONResponse({"detail": "Search requires a nonempty query without a date"}, status_code=400, headers=headers)
+    if date is not None and date not in dates:
+        return JSONResponse({"detail": "No recommendations for this date"}, status_code=404, headers=headers)
+    selected_date = date or (dates[0] if dates else None)
+    if q is not None:
+        rows = await db.search_recommended_papers(q.strip(), limit)
+        total = rows[0]["matched_count"] if rows else 0
+        selected_date = None
+    else:
+        rows = await db.get_papers_by_date(selected_date) if selected_date else []
+        total = len(rows)
+        rows = rows[:limit]
+    papers = []
+    for row in rows:
+        authors = row.get("authors") or []
+        if isinstance(authors, str):
+            try:
+                authors = json.loads(authors)
+            except json.JSONDecodeError:
+                authors = []
+        pdf_url = row.get("pdf_url")
+        try:
+            arxiv_id(pdf_url or "")
+        except ExportError:
+            pdf_url = None
+        papers.append({
+            "id": row["id"], "date": row["date"], "title": row["title"],
+            "authors": authors if isinstance(authors, list) else [],
+            "abstract": str(row.get("abstract") or "")[:6000],
+            "tldr": str(row.get("tldr") or "")[:3200],
+            "reason": str(row.get("judge_reason") or "")[:2000],
+            "why_for_me": str(row.get("why_for_me") or "")[:2000],
+            "score": row.get("judge_relevance") if row.get("judge_relevance") is not None else row.get("score"),
+            "score_max": 5 if row.get("judge_relevance") is not None else 10,
+            "pdf_url": pdf_url,
+            "detail_url": f"https://arxiv.luolimasi.xyz/date/{row['date']}#paper-{row['id']}",
+        })
+    return JSONResponse({"date": selected_date, "dates": dates[:30], "total": total,
+                         "papers": papers}, headers=headers)
 
 
 @app.get("/api/config/admin")

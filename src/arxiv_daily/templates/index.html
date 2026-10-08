@@ -141,7 +141,7 @@
                     {% set judge_label = "偏低" %}
                 {% endif %}
             {% endif %}
-            <div class="paper-card {{ score_tier }}" data-score="{{ score }}">
+            <div class="paper-card {{ score_tier }}" id="paper-{{ paper.id }}" data-score="{{ score }}">
                 <div class="paper-header">
                     <h3 class="paper-title">
                         <a href="{{ paper.url }}" target="_blank" rel="noopener noreferrer">{{ paper.title }}</a>

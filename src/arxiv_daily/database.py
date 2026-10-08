@@ -782,6 +782,21 @@ async def get_all_dates(db_path: Optional[str] = None) -> list[str]:
         return [r[0] for r in rows]
 
 
+async def search_recommended_papers(
+    query: str, limit: int = 10, db_path: str | None = None
+) -> list[dict[str, Any]]:
+    async with _connect(db_path, row_factory=True) as conn:
+        cursor = await conn.execute(
+            """SELECT papers.*, COUNT(*) OVER() AS matched_count FROM papers
+               WHERE instr(lower(COALESCE(title, '') || char(10) || COALESCE(abstract, '')
+                           || char(10) || COALESCE(tldr, '') || char(10) || COALESCE(authors, '')),
+                           lower(?)) > 0
+               ORDER BY date DESC, judge_relevance DESC, score DESC, id ASC LIMIT ?""",
+            (query, limit),
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+
 async def get_paper_count(db_path: Optional[str] = None) -> int:
     async with _connect(db_path) as db:
         cursor = await db.execute("SELECT COUNT(*) FROM papers")
