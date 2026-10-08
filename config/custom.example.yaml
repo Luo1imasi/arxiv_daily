@@ -5,6 +5,11 @@ webdav:
   path: "/papers/"
   local_path: ""
 
+zotero:
+  api_key: ""
+  user_id: ""
+  collection_key: ""
+
 source:
   arxiv:
     use_keyword_search: true

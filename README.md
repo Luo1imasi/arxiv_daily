@@ -71,6 +71,30 @@ http://127.0.0.1:5555
 
 Web 页面里的运行任务、回填、保存配置、测试连接和重载 corpus 等修改性操作需要输入操作密码。默认密码在 `server.admin_password` 中配置，也可以通过环境变量 `ARXIV_DAILY_ADMIN_PASSWORD` 覆盖。
 
+## 收藏到 Zotero
+
+在 Settings 中填写 Zotero User ID、具有个人库读写权限的 API Key，以及可选的
+Collection Key，然后点击推荐论文上的“加入 Zotero”。User ID 和 API Key 可在
+https://www.zotero.org/settings/keys 获取。也可以配置：
+
+```yaml
+zotero:
+  user_id: "1234567"
+  api_key: "your-api-key"
+  collection_key: ""  # 可选的八位 collection key
+```
+
+API Key 和 User ID 也可通过 `ARXIV_DAILY_ZOTERO_API_KEY` 和
+`ARXIV_DAILY_ZOTERO_USER_ID` 环境变量设置，环境变量优先。
+
+收藏会创建论文及 PDF 附件条目，并将 ZIP/PROP 附件保存到现有 WebDAV 来源。
+设置了 `webdav.local_path` 时服务进程需要该目录的写权限；否则使用 HTTPS WebDAV
+上传，目标目录须已存在。Zotero 客户端需要启用同一账号的数据同步和同一 WebDAV
+的文件同步。这一流程只支持个人库。
+
+成功收藏的论文立即进入 corpus，并在重载后保留。失败时点击“重试收藏”可继续，
+已经创建的条目会复用。收藏状态保存在 arXiv Daily 数据目录中。
+
 ## 项目结构
 
 ```text

@@ -29,6 +29,7 @@ from .config import (
 )
 from .executor import Executor
 from .task_runner import TaskRunner
+from .zotero import ExportError, arxiv_id, export_paper, settings as zotero_settings
 from .business_date import (
     business_date_range_between,
     get_business_date,
@@ -120,7 +121,7 @@ def public_config(config: dict[str, Any]) -> dict[str, Any]:
 def admin_config_view(config: dict[str, Any]) -> dict[str, Any]:
     """Full settings for an authenticated operator, with secrets removed."""
     redacted = copy.deepcopy(config)
-    for section_name in ("webdav", "llm", "server"):
+    for section_name in ("webdav", "llm", "server", "zotero"):
         section = redacted.get(section_name)
         if not isinstance(section, dict):
             continue
@@ -191,6 +192,16 @@ def _decorate_latest_run_for_display(
 async def _build_page_context(current_date: str | None) -> dict[str, Any]:
     dates = await db.get_all_dates()
     papers = await db.get_papers_by_date(current_date) if current_date else []
+    library_id = zotero_settings(_app_config)["user_id"]
+    exports = {
+        r["arxiv_id"]: r for r in await db.load_zotero_exports()
+        if r["library_id"] == library_id
+    }
+    for paper in papers:
+        try:
+            paper["zotero_status"] = exports.get(arxiv_id(paper["url"]), {}).get("status", "")
+        except ExportError:
+            paper["zotero_status"] = ""
     corpus_count = await db.get_corpus_count()
     status = await _task_runner.get_status()
     latest_run = _decorate_latest_run_for_display(status.get("latest_run"), _app_config)
@@ -431,7 +442,7 @@ async def update_config(request: Request):
     def is_masked(v: str) -> bool:
         return v == "****" or (v.endswith("****") and len(v) > 4)
 
-    for section_key in ("webdav", "llm"):
+    for section_key in ("webdav", "llm", "zotero"):
         old_section = _app_config.get(section_key, {})
         new_section = body.get(section_key, {})
         for k in SENSITIVE_KEYS:
@@ -528,6 +539,23 @@ async def save_feedback(request: Request):
         tldr=str(body.get("tldr") or ""),
     )
     return JSONResponse({"status": "ok", "vote": vote})
+
+
+@app.post("/api/papers/{paper_id}/zotero")
+async def save_to_zotero(paper_id: int, request: Request):
+    await _require_admin_password(request)
+    paper = await db.get_paper_by_id(paper_id)
+    if paper is None:
+        raise HTTPException(status_code=404, detail="Paper not found")
+    try:
+        record = await export_paper(paper, copy.deepcopy(_app_config))
+    except ExportError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from None
+    return JSONResponse({
+        "status": record["status"],
+        "item_key": record["paper_key"],
+        "corpus_size": await db.get_corpus_count(),
+    })
 
 
 @app.post("/api/enrich")

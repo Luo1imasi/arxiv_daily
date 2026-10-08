@@ -36,6 +36,13 @@ _INIT_DB_SQL = """
     CREATE INDEX IF NOT EXISTS idx_papers_date ON papers(date);
     CREATE INDEX IF NOT EXISTS idx_papers_url ON papers(url);
 
+    CREATE TABLE IF NOT EXISTS zotero_exports (
+        library_id TEXT NOT NULL,
+        arxiv_id TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        PRIMARY KEY (library_id, arxiv_id)
+    );
+
     CREATE TABLE IF NOT EXISTS corpus_cache (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         title TEXT NOT NULL,
@@ -835,11 +842,8 @@ async def get_seen_paper_content_keys(
 
 
 async def get_corpus_count(db_path: Optional[str] = None) -> int:
-    """获取corpus缓存数量，避免加载全部数据"""
-    async with _connect(db_path) as db:
-        cursor = await db.execute("SELECT COUNT(*) FROM corpus_cache")
-        row = await cursor.fetchone()
-        return row[0] if row else 0
+    """Count the corpus including persistent Zotero exports, without duplicates."""
+    return len(await load_corpus_cache(db_path))
 
 
 async def save_corpus_cache(corpus: list[CorpusPaper], db_path: Optional[str] = None) -> None:
@@ -946,7 +950,55 @@ async def load_corpus_cache(db_path: Optional[str] = None) -> list[CorpusPaper]:
     async with _connect(db_path, row_factory=True) as db:
         cursor = await db.execute("SELECT * FROM corpus_cache")
         rows = await cursor.fetchall()
-        return [_corpus_paper_from_row(row) for row in rows]
+        papers = [_corpus_paper_from_row(row) for row in rows]
+    return await merge_exported_corpus(papers, db_path)
+
+
+async def get_paper_by_id(paper_id: int, db_path: str | None = None) -> dict[str, Any] | None:
+    async with _connect(db_path, row_factory=True) as conn:
+        cursor = await conn.execute("SELECT * FROM papers WHERE id = ?", (paper_id,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def load_zotero_exports(db_path: str | None = None) -> list[dict[str, Any]]:
+    async with _connect(db_path) as conn:
+        cursor = await conn.execute("SELECT payload FROM zotero_exports")
+        return [json.loads(row[0]) for row in await cursor.fetchall()]
+
+
+async def save_zotero_export(record: dict[str, Any], db_path: str | None = None) -> None:
+    async with _connect(db_path) as conn:
+        await conn.execute(
+            "INSERT INTO zotero_exports (library_id, arxiv_id, payload) VALUES (?, ?, ?) "
+            "ON CONFLICT(library_id, arxiv_id) DO UPDATE SET payload = excluded.payload",
+            (record["library_id"], record["arxiv_id"], json.dumps(record, ensure_ascii=False)),
+        )
+        await conn.commit()
+
+
+async def merge_exported_corpus(
+    papers: list[CorpusPaper], db_path: str | None = None
+) -> list[CorpusPaper]:
+    for record in await load_zotero_exports(db_path):
+        if record.get("status") != "saved":
+            continue
+        paper = CorpusPaper(
+            title=record["title"],
+            abstract=record["abstract"],
+            authors=record["authors"],
+            added_date=datetime.fromisoformat(record["added_date"]),
+            file_path=record["file_path"],
+            source_path=record["source_path"],
+        )
+        key = make_content_key(paper.title, paper.abstract)
+        papers = [
+            p for p in papers
+            if p.source_path.lstrip("/") != paper.source_path.lstrip("/")
+            and make_content_key(p.title, p.abstract) != key
+        ]
+        papers.append(paper)
+    return papers
 
 
 async def save_embeddings(

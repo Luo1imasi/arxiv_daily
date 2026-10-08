@@ -19,18 +19,18 @@
             </button>
             <div class="backfill-controls">
                 <label class="backfill-date-label">
-                    <span>From</span>
-                    <input type="date" id="backfillStartDate" aria-label="Backfill start date">
+                    <span>开始日期</span>
+                    <input type="date" id="backfillStartDate" aria-label="开始日期">
                 </label>
                 <label class="backfill-date-label">
-                    <span>To</span>
-                    <input type="date" id="backfillEndDate" aria-label="Backfill end date">
+                    <span>结束日期</span>
+                    <input type="date" id="backfillEndDate" aria-label="结束日期">
                 </label>
                 <button type="button" class="btn btn-secondary" onclick="triggerBackfill()" id="backfillBtn">
-                    Backfill
+                    重新生成推荐
                 </button>
                 <button type="button" class="btn btn-secondary" onclick="triggerEnrich()" id="enrichBtn">
-                    补全已入库
+                    更新推荐解读
                 </button>
             </div>
         </div>
@@ -217,6 +217,10 @@
                 </div>
 
                 <div class="paper-links">
+                    <button type="button" class="btn-link btn-zotero" data-paper-id="{{ paper.id }}"
+                            {% if paper.zotero_status == 'saved' %}disabled{% endif %}>
+                        {% if paper.zotero_status == 'saved' %}已加入 Zotero{% elif paper.zotero_status == 'failed' %}重试收藏{% else %}加入 Zotero{% endif %}
+                    </button>
                     {% if paper.pdf_url %}
                     <a href="{{ paper.pdf_url }}" target="_blank" rel="noopener noreferrer" class="btn-link btn-pdf">PDF</a>
                     {% endif %}
@@ -267,6 +271,22 @@
                             <button type="button" class="btn btn-secondary" onclick="reloadCorpus()" id="reloadCorpusBtn">Reload Corpus</button>
                         </div>
                         <span id="webdav-test-result"></span>
+                    </div>
+
+                    <div class="form-section">
+                        <h3>Zotero</h3>
+                        <div class="form-group">
+                            <label for="cfg_zotero_user_id">User ID</label>
+                            <input type="text" id="cfg_zotero_user_id" inputmode="numeric">
+                        </div>
+                        <div class="form-group">
+                            <label for="cfg_zotero_api_key">API Key</label>
+                            <input type="password" id="cfg_zotero_api_key" autocomplete="new-password">
+                        </div>
+                        <div class="form-group">
+                            <label for="cfg_zotero_collection_key">Collection Key (optional)</label>
+                            <input type="text" id="cfg_zotero_collection_key" maxlength="8">
+                        </div>
                     </div>
 
                     <div class="form-section">
@@ -442,9 +462,16 @@
         return result;
     }
 
+    function displayTaskName(name) {
+        return {
+            'recommendation backfill': '重新生成推荐',
+            'enrich saved papers': '更新推荐解读',
+        }[name] || name || 'Task';
+    }
+
     function setTaskState(data = {}) {
         const running = Boolean(data.running);
-        const taskName = data.task_name || 'task';
+        const taskName = displayTaskName(data.task_name);
         const runBtn = document.getElementById('runBtn');
         const backfillBtn = document.getElementById('backfillBtn');
         const enrichBtn = document.getElementById('enrichBtn');
@@ -462,7 +489,7 @@
         if (running) {
             runBtn.textContent = 'Running...';
             banner.classList.remove('hidden');
-            bannerText.textContent = `${taskName} is running...`;
+            bannerText.textContent = `${taskName}：执行中...`;
         } else {
             runBtn.textContent = 'Run Now';
             banner.classList.add('hidden');
@@ -562,7 +589,7 @@
                 body: JSON.stringify({start_date: startDate, end_date: endDate}),
             });
             if (resp.ok) {
-                showToast(`Backfill started from ${startDate} to ${endDate}. Existing days will be overwritten.`, 'success');
+                showToast(`正在重新生成 ${startDate} 至 ${endDate} 的推荐，将替换该范围内的原推荐列表。`, 'success');
                 pollStatus();
             } else {
                 showToast(data.detail || 'Failed to start backfill', 'error');
@@ -590,9 +617,9 @@
                     statusPollTimer = setTimeout(check, 3000);
                 } else if (data.done) {
                     if (data.error) {
-                        showToast((data.task_name || 'Task') + ' failed: ' + data.error, 'error', 0);
+                        showToast(displayTaskName(data.task_name) + '失败：' + data.error, 'error', 0);
                     } else {
-                        showToast((data.task_name || 'Task') + ' completed! Reloading...', 'success');
+                        showToast(displayTaskName(data.task_name) + '完成，正在刷新...', 'success');
                         setTimeout(() => location.reload(), 1000);
                     }
                 } else if (data.error) {
@@ -611,12 +638,12 @@
             return;
         }
         if (data.running) {
-            showToast((data.task_name || 'Task') + ' is still running...', 'info');
+            showToast(displayTaskName(data.task_name) + '：执行中...', 'info');
         } else if (data.done) {
             if (data.error) {
-                showToast((data.task_name || 'Task') + ' failed: ' + data.error, 'error', 0);
+                showToast(displayTaskName(data.task_name) + '失败：' + data.error, 'error', 0);
             } else {
-                showToast((data.task_name || 'Task') + ' completed!', 'success');
+                showToast(displayTaskName(data.task_name) + '完成', 'success');
                 setTimeout(() => location.reload(), 1000);
             }
         }
@@ -662,6 +689,10 @@
             document.getElementById('cfg_webdav_username').value = cfg.webdav?.username || '';
             document.getElementById('cfg_webdav_password').value = '';
             document.getElementById('cfg_webdav_path').value = cfg.webdav?.path || '/papers';
+            document.getElementById('cfg_zotero_user_id').value = cfg.zotero?.user_id || '';
+            document.getElementById('cfg_zotero_api_key').value = '';
+            document.getElementById('cfg_zotero_api_key').placeholder = cfg.zotero?.api_key_set ? '已配置' : '';
+            document.getElementById('cfg_zotero_collection_key').value = cfg.zotero?.collection_key || '';
             document.getElementById('cfg_arxiv_category').value = (cfg.source?.arxiv?.category || []).join(', ');
             document.getElementById('cfg_arxiv_cross_list').checked = cfg.source?.arxiv?.include_cross_list || false;
             document.getElementById('cfg_llm_api_key').value = '';
@@ -693,6 +724,11 @@
             .split(',').map(s => s.trim()).filter(Boolean);
 
         const config = {
+            zotero: {
+                user_id: document.getElementById('cfg_zotero_user_id').value.trim(),
+                api_key: document.getElementById('cfg_zotero_api_key').value || undefined,
+                collection_key: document.getElementById('cfg_zotero_collection_key').value.trim(),
+            },
             webdav: {
                 local_path: document.getElementById('cfg_webdav_local_path').value || '',
                 url: document.getElementById('cfg_webdav_url').value,
@@ -816,7 +852,7 @@
         }
     }
 
-    (async function loadStats() {
+    async function loadStats() {
         try {
             const { data: stats } = await fetchJson(API_BASE + '/api/stats');
             const container = document.getElementById('stats-content');
@@ -859,7 +895,7 @@
                 item.append('Last run: ');
                 item.appendChild(status);
                 if (run.task_name) {
-                    item.append(` (${run.task_name})`);
+                    item.append(` (${displayTaskName(run.task_name)})`);
                 }
                 container.appendChild(item);
 
@@ -919,7 +955,8 @@
         } catch(e) {
             document.getElementById('stats-content').textContent = 'Failed to load stats';
         }
-    })();
+    }
+    loadStats();
 
     (async function initPageState() {
         setupBackfillDateInputs();
@@ -960,10 +997,10 @@
                 body: JSON.stringify({start_date: range.startDate, end_date: range.endDate}),
             });
             if (resp.ok) {
-                showToast(`正在补全 ${range.startDate} 到 ${range.endDate} 的已入库论文，不会重新拉取 arXiv。`, 'success');
+                showToast(`正在更新 ${range.startDate} 至 ${range.endDate} 推荐论文的 AI 摘要、相关性评分和推荐理由。`, 'success');
                 pollStatus();
             } else {
-                showToast(data.detail || '补全失败', 'error');
+                showToast(data.detail || '更新推荐解读失败', 'error');
                 await fetchTaskStatus();
             }
         } catch (e) {
@@ -1017,6 +1054,24 @@
             box.textContent = e.message;
         }
     }
+
+    document.addEventListener('click', async (event) => {
+        const button = event.target.closest('.btn-zotero');
+        if (!button || button.disabled) return;
+        button.disabled = true;
+        button.textContent = '保存中...';
+        try {
+            const { resp, data } = await fetchMutationJson(API_BASE + '/api/papers/' + button.dataset.paperId + '/zotero', {method: 'POST'});
+            if (!resp.ok) throw new Error(data.detail || '收藏失败');
+            button.textContent = '已加入 Zotero';
+            showToast('已加入 Zotero 和 corpus', 'success');
+            loadStats();
+        } catch (error) {
+            button.disabled = false;
+            button.textContent = '重试收藏';
+            showToast(error.message, 'error');
+        }
+    });
 
     document.addEventListener('click', async (event) => {
         const button = event.target.closest('.btn-feedback');

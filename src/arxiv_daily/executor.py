@@ -807,7 +807,7 @@ class Executor:
         loop = asyncio.get_event_loop()
         previous_corpus = cached if cached else None
         previous_manifest = cached_manifest
-        return await loop.run_in_executor(
+        corpus = await loop.run_in_executor(
             get_executor_pool(self.config),
             lambda: fetch_corpus(
                 self.config["webdav"],
@@ -816,6 +816,7 @@ class Executor:
                 previous_manifest=previous_manifest,
             ),
         )
+        return await db.merge_exported_corpus(corpus)
 
     async def run(self, skip_tldr: bool = False) -> list[Paper]:
         business_date = _get_business_date(self.config)
