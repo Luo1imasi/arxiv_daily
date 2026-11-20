@@ -100,7 +100,7 @@ API Key 和 User ID 也可通过 `ARXIV_DAILY_ZOTERO_API_KEY` 和
 `GET /api/widget` 提供最新推荐日期、推荐数量和排名靠前的论文标题、简短 TLDR、
 评分与详情链接。默认返回 3 篇，`limit` 可设为 1 到 5，不需要操作密码。
 浏览器跨域读取仅允许 `server.widget_allowed_origins` 中配置的网站；默认允许
-`luolimasi.xyz`、`luolimasi.com` 及其 `www` 域名。响应可缓存 60 秒。
+`luolimasi.com` 及其 `www` 域名。响应可缓存 60 秒。
 
 主页终端使用只读的 `GET /api/terminal`：默认返回最新一期前 5 篇推荐；`date`
 可指定推荐日期，`q` 可搜索历史推荐的标题、作者、摘要和 TLDR，`limit` 为 1 到 10。

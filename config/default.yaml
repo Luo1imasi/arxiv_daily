@@ -102,7 +102,5 @@ server:
   port: 5555
   admin_password: "admin"
   widget_allowed_origins:
-    - "https://luolimasi.xyz"
-    - "https://www.luolimasi.xyz"
     - "https://luolimasi.com"
     - "https://www.luolimasi.com"

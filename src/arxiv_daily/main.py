@@ -447,7 +447,7 @@ async def latest_widget(request: Request, limit: int = Query(3, ge=1, le=5)):
             "tldr": str(row.get("tldr") or "")[:320],
             "score": row.get("judge_relevance") if row.get("judge_relevance") is not None else row.get("score"),
             "score_max": 5 if row.get("judge_relevance") is not None else 10,
-            "detail_url": f"https://arxiv.luolimasi.xyz/date/{latest_date}#paper-{row['id']}",
+            "detail_url": f"https://arxiv.luolimasi.com/date/{latest_date}#paper-{row['id']}",
         } for row in rows[:limit]],
     }, headers=_public_read_headers(request))
 
@@ -497,7 +497,7 @@ async def terminal_papers(
             "score": row.get("judge_relevance") if row.get("judge_relevance") is not None else row.get("score"),
             "score_max": 5 if row.get("judge_relevance") is not None else 10,
             "pdf_url": pdf_url,
-            "detail_url": f"https://arxiv.luolimasi.xyz/date/{row['date']}#paper-{row['id']}",
+            "detail_url": f"https://arxiv.luolimasi.com/date/{row['date']}#paper-{row['id']}",
         })
     return JSONResponse({"date": selected_date, "dates": dates[:30], "total": total,
                          "papers": papers}, headers=headers)

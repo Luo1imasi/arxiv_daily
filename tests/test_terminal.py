@@ -50,7 +50,7 @@ async def test_terminal_search_and_private_fields(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "get_all_dates", dates)
     monkeypatch.setattr(db, "search_recommended_papers", search)
     request = Request(
-        {"type": "http", "headers": [(b"origin", b"https://luolimasi.xyz")]}
+        {"type": "http", "headers": [(b"origin", b"https://luolimasi.com")]}
     )
     response = await main.terminal_papers(request, date=None, q="humanoid", limit=1)
     data = json.loads(response.body)
@@ -58,7 +58,7 @@ async def test_terminal_search_and_private_fields(tmp_path, monkeypatch):
     assert data["papers"][0]["authors"] == ["Author"]
     assert data["papers"][0]["pdf_url"].startswith("https://arxiv.org/pdf/")
     assert "feedback_vote" not in response.body.decode()
-    assert response.headers["access-control-allow-origin"] == "https://luolimasi.xyz"
+    assert response.headers["access-control-allow-origin"] == "https://luolimasi.com"
     missing = await main.terminal_papers(request, date="2000-01-01", q=None, limit=5)
     assert missing.status_code == 404
     invalid = await main.terminal_papers(request, date=None, q="   ", limit=5)

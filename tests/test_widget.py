@@ -36,7 +36,7 @@ async def test_widget_public_fields_and_allowed_origin(monkeypatch):
     monkeypatch.setattr(db, "get_papers_by_date", papers)
     monkeypatch.setattr(main, "_app_config", {})
     request = Request(
-        {"type": "http", "headers": [(b"origin", b"https://luolimasi.xyz")]}
+        {"type": "http", "headers": [(b"origin", b"https://luolimasi.com")]}
     )
     response = await main.latest_widget(request, limit=3)
     data = json.loads(response.body)
@@ -47,7 +47,7 @@ async def test_widget_public_fields_and_allowed_origin(monkeypatch):
     assert len(data["papers"][0]["tldr"]) == 320
     assert "private-field" not in response.body.decode()
     assert "feedback_vote" not in response.body.decode()
-    assert response.headers["access-control-allow-origin"] == "https://luolimasi.xyz"
+    assert response.headers["access-control-allow-origin"] == "https://luolimasi.com"
     assert response.headers["vary"] == "Origin"
 
 
